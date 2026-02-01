@@ -1,0 +1,16 @@
+[package]
+name = "xy_back_end"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.7.5"
+tokio = { version = "1.37.0", features = ["full"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+ferris-says = "0.3.2"
+jsonwebtoken = "9.3.0"
+bcrypt = "0.15.1"
+chrono = { version = "0.4.37", features = ["serde"] }
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+tower-http = { version = "0.6.8", features = ["cors"] }

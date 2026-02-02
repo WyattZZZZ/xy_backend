@@ -1,3 +1,5 @@
+pub mod search;
+
 use axum::{
     routing::{get, post, delete},
     Json, Router,
@@ -5,176 +7,48 @@ use axum::{
     response::IntoResponse,
     extract::{Path, State, Query},
 };
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use chrono::{DateTime, Utc};
-
-// --- Models ---
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Role {
-    User,
-    Admin,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
-pub struct Coordinates {
-    pub lat: f64,
-    pub lng: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct User {
-    pub id: String,
-    pub email: String,
-    pub password_hash: String,
-    pub name: String,
-    pub avatar: String,
-    pub gender: String,
-    pub bio: String,
-    pub location: String,
-    pub posts: i32,
-    pub following: i32,
-    pub fans: i32,
-    pub rating: f32,
-    pub reviews_count: i32,
-    pub coordinates: Option<Coordinates>,
-    pub is_verified: bool,
-    pub role: Role,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub struct UserResponse {
-    pub id: String,
-    pub email: String,
-    pub name: String,
-    pub avatar: String,
-    pub gender: String,
-    pub bio: String,
-    pub location: String,
-    pub posts: i32,
-    pub following: i32,
-    pub fans: i32,
-    pub rating: f32,
-    pub reviews_count: i32,
-    pub coordinates: Option<Coordinates>,
-    pub is_verified: bool,
-    pub role: Role,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl From<User> for UserResponse {
-    fn from(user: User) -> Self {
-        UserResponse {
-            id: user.id,
-            email: user.email,
-            name: user.name,
-            avatar: user.avatar,
-            gender: user.gender,
-            bio: user.bio,
-            location: user.location,
-            posts: user.posts,
-            following: user.following,
-            fans: user.fans,
-            rating: user.rating,
-            reviews_count: user.reviews_count,
-            coordinates: user.coordinates,
-            is_verified: user.is_verified,
-            role: user.role,
-            created_at: user.created_at,
-            updated_at: user.updated_at,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateUserRequest {
-    pub name: Option<String>,
-    pub avatar: Option<String>,
-    pub gender: Option<String>, // Added gender field
-    pub bio: Option<String>,
-    pub location: Option<String>,
-    pub posts: Option<i32>,
-    pub following: Option<i32>,
-    pub fans: Option<i32>,
-    pub rating: Option<f32>,
-    pub reviews_count: Option<i32>,
-    pub coordinates: Option<Coordinates>,
-    pub is_verified: Option<bool>,
-    pub role: Option<Role>,
-}
-
-#[derive(Deserialize)]
-pub struct UserFilter {
-    pub role: Option<Role>,
-    pub sort: Option<String>, // e.g., "created_at:desc"
-}
-
-pub type UserDb = Arc<Mutex<HashMap<String, User>>>;
+use std::sync::Arc;
+use chrono::Utc;
+use crate::database::Database;
+use crate::database::models::{
+    Role, User, UserResponse, UpdateUserRequest, UserFilter
+};
+use crate::verify::auth::get_user_id_from_token;
 
 // --- Routes ---
 
-pub fn routes(state: UserDb) -> Router {
+pub fn routes(db: Arc<Database>) -> Router {
     Router::new()
         .route("/", get(list_users_handler))
-        .route("/me", get(get_me_handler))
         .route("/:id", get(get_user_handler))
         .route("/:id", post(update_user_handler))
         .route("/:id", delete(delete_user_handler))
-        .with_state(state)
+        .with_state(db)
 }
-
-// --- Auth Utilities (duplicated from auth.rs for now, or move to a common module) ---
-// In a real app, these would be in a middleware or common library
-const JWT_SECRET: &[u8] = b"secret_key_change_me_in_production";
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-}
-
-fn get_user_id_from_token(headers: &HeaderMap) -> Option<String> {
-    let auth_header = headers.get("Authorization")?.to_str().ok()?;
-    if !auth_header.starts_with("Bearer ") {
-        return None;
-    }
-    let token = &auth_header[7..];
-    let token_data = jsonwebtoken::decode::<Claims>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(JWT_SECRET),
-        &jsonwebtoken::Validation::default(),
-    ).ok()?;
-    Some(token_data.claims.sub)
-}
-
-// --- Handlers ---
 
 async fn get_user_handler(
-    State(db): State<UserDb>,
+    State(db): State<Arc<Database>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let users = db.lock().unwrap();
+    let users = db.users.lock().unwrap();
     match users.get(&id) {
-        Some(user) => (StatusCode::OK, Json(UserResponse::from(user.clone()))).into_response(),
+        Some(user) => {
+            let mut resp = UserResponse::from(user.clone());
+            resp.is_online = db.conns.contains_key(&id);
+            (StatusCode::OK, Json(resp)).into_response()
+        },
         None => (StatusCode::NOT_FOUND, "User not found").into_response(),
     }
 }
 
 async fn list_users_handler(
-    State(db): State<UserDb>,
+    State(db): State<Arc<Database>>,
     Query(filter): Query<UserFilter>,
 ) -> impl IntoResponse {
-    let users_map = db.lock().unwrap();
-    let mut users: Vec<UserResponse> = users_map.values()
+    let users_map = db.users.lock().unwrap();
+    
+    // First filter by role
+    let filtered: Vec<User> = users_map.values()
         .filter(|u| {
             if let Some(role) = filter.role {
                 u.role == role
@@ -182,10 +56,17 @@ async fn list_users_handler(
                 true
             }
         })
-        .map(|u| UserResponse::from(u.clone()))
+        .cloned()
         .collect();
 
-    // Sort if needed
+    // Then apply search
+    let mut users = if let Some(ref query) = filter.query {
+        search::search_users(&filtered, query)
+    } else {
+        filtered.iter().map(|u| UserResponse::from(u.clone())).collect()
+    };
+
+    // Finally apply sorting
     if let Some(sort) = filter.sort {
         match sort.as_str() {
             "createdAt:asc" => users.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
@@ -194,27 +75,18 @@ async fn list_users_handler(
         }
     }
 
+    // Map with online status
+    let users: Vec<UserResponse> = users.into_iter().map(|mut u| {
+        u.is_online = db.conns.contains_key(&u.id);
+        u
+    }).collect();
+
     Json(users)
 }
 
-async fn get_me_handler(
-    State(db): State<UserDb>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let user_id = match get_user_id_from_token(&headers) {
-        Some(id) => id,
-        None => return StatusCode::UNAUTHORIZED.into_response(),
-    };
-
-    let users = db.lock().unwrap();
-    match users.get(&user_id) {
-        Some(user) => (StatusCode::OK, Json(UserResponse::from(user.clone()))).into_response(),
-        None => (StatusCode::UNAUTHORIZED, "Invalid user").into_response(),
-    }
-}
 
 async fn update_user_handler(
-    State(db): State<UserDb>,
+    State(db): State<Arc<Database>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(payload): Json<UpdateUserRequest>,
@@ -224,11 +96,8 @@ async fn update_user_handler(
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    // Permission check: only self or admin can update (simple check)
-    // In a full app, we'd check if auth_user.role == Admin
     if authenticated_id != id {
-         // Check if authenticated user is admin
-         let users_check = db.lock().unwrap();
+         let users_check = db.users.lock().unwrap();
          let auth_user = users_check.get(&authenticated_id);
          let is_admin = auth_user.map(|u| u.role == Role::Admin).unwrap_or(false);
          if !is_admin {
@@ -236,7 +105,7 @@ async fn update_user_handler(
          }
     }
 
-    let mut users = db.lock().unwrap();
+    let mut users = db.users.lock().unwrap();
     if let Some(user) = users.get_mut(&id) {
         if let Some(name) = payload.name { user.name = name; }
         if let Some(avatar) = payload.avatar { user.avatar = avatar; }
@@ -253,14 +122,17 @@ async fn update_user_handler(
         if let Some(role) = payload.role { user.role = role; }
         
         user.updated_at = Utc::now();
-        (StatusCode::OK, Json(UserResponse::from(user.clone()))).into_response()
+        let resp = UserResponse::from(user.clone());
+        drop(users);
+        db.save_all();
+        (StatusCode::OK, Json(resp)).into_response()
     } else {
         (StatusCode::NOT_FOUND, "User not found").into_response()
     }
 }
 
 async fn delete_user_handler(
-    State(db): State<UserDb>,
+    State(db): State<Arc<Database>>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -269,15 +141,15 @@ async fn delete_user_handler(
         None => return StatusCode::UNAUTHORIZED.into_response(),
     };
 
-    // Only Admin can delete or self-delete
-    let mut users = db.lock().unwrap();
-    
+    let mut users = db.users.lock().unwrap();
     let is_admin = users.get(&authenticated_id).map(|u| u.role == Role::Admin).unwrap_or(false);
     if authenticated_id != id && !is_admin {
         return (StatusCode::FORBIDDEN, "Permission denied").into_response();
     }
 
     if users.remove(&id).is_some() {
+        drop(users);
+        db.save_all();
         StatusCode::NO_CONTENT.into_response()
     } else {
         (StatusCode::NOT_FOUND, "User not found").into_response()

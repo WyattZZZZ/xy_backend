@@ -1,16 +1,18 @@
 mod verify;
 mod user;
+mod social;
+mod database;
 
-use axum::Router;
+use axum::{Router, routing::get};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
+use std::sync::Arc;
+use crate::database::Database;
 
 #[tokio::main]
 async fn main() {
-    // Initialize shared state
-    let db: user::UserDb = Arc::new(Mutex::new(HashMap::new()));
+    // Initialize central database (loads from files)
+    let db = Arc::new(Database::new());
 
     let cors = tower_http::cors::CorsLayer::new()
         .allow_origin(tower_http::cors::Any)
@@ -21,6 +23,10 @@ async fn main() {
     let app = Router::new()
         .nest("/auth", verify::routes(db.clone()))
         .nest("/user", user::routes(db.clone()))
+        .nest("/social", social::social_routes(db.clone()))
+        .nest("/conversation", social::conversation_routes(db.clone()))
+        .nest("/group", social::group_routes(db.clone()))
+        .route("/ws", get(social::ws_handler).with_state(db.clone()))
         .layer(cors);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 8081));

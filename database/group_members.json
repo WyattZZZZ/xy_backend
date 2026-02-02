@@ -1,0 +1,26 @@
+[
+  {
+    "groupId": "a64bf58e-a38e-40dd-a4cb-830a0389091c",
+    "userId": "3aca76fa-715c-4990-b8bc-247f996b676d",
+    "joinTime": "2026-02-02T03:38:57.485737931Z",
+    "role": "ADMIN",
+    "muteUntil": null,
+    "isMuted": false
+  },
+  {
+    "groupId": "a64bf58e-a38e-40dd-a4cb-830a0389091c",
+    "userId": "ecc1c57c-35fb-468f-8266-cdaed7744cad",
+    "joinTime": "2026-02-02T03:38:57.485737931Z",
+    "role": "NORMAL",
+    "muteUntil": null,
+    "isMuted": false
+  },
+  {
+    "groupId": "a64bf58e-a38e-40dd-a4cb-830a0389091c",
+    "userId": "7d511d44-6d0e-4de7-a380-2efde95db15c",
+    "joinTime": "2026-02-02T03:38:57.485737931Z",
+    "role": "NORMAL",
+    "muteUntil": null,
+    "isMuted": false
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "followerId": "test_user",
+    "followingId": "ecc1c57c-35fb-468f-8266-cdaed7744cad",
+    "createdAt": "2026-02-02T02:48:16.376507797Z"
+  },
+  {
+    "followerId": "3aca76fa-715c-4990-b8bc-247f996b676d",
+    "followingId": "ecc1c57c-35fb-468f-8266-cdaed7744cad",
+    "createdAt": "2026-02-02T03:01:06.776807827Z"
+  },
+  {
+    "followerId": "7d511d44-6d0e-4de7-a380-2efde95db15c",
+    "followingId": "3aca76fa-715c-4990-b8bc-247f996b676d",
+    "createdAt": "2026-02-02T03:24:52.398773821Z"
+  },
+  {
+    "followerId": "3aca76fa-715c-4990-b8bc-247f996b676d",
+    "followingId": "7d511d44-6d0e-4de7-a380-2efde95db15c",
+    "createdAt": "2026-02-02T03:38:52.295433631Z"
+  }
+]

@@ -3,48 +3,35 @@ use axum::{
     Json, Router,
     http::StatusCode,
     response::IntoResponse,
+    extract::State,
 };
-use serde::Deserialize;
-use jsonwebtoken::{encode, Header, EncodingKey};
+use jsonwebtoken::{encode, decode, Header, EncodingKey, DecodingKey, Validation};
 use bcrypt::{hash, verify, DEFAULT_COST};
 use chrono::{Utc, Duration};
-use crate::user::{User, UserDb, Role};
+use std::sync::Arc;
+use axum::http::HeaderMap;
+use crate::database::Database;
+use crate::database::models::{
+    User, Role, RegisterRequest, LoginRequest, AuthResponse, AuthUserResponse, Claims
+};
 
-#[derive(Deserialize)]
-pub struct RegisterRequest {
-    pub username: String, // This will be used as the initial name
-    pub email: String,
-    pub password: String,
+pub const JWT_SECRET: &[u8] = b"secret_key_change_me_in_production";
+
+pub fn get_user_id_from_token(headers: &HeaderMap) -> Option<String> {
+    let auth_header = headers.get("Authorization")?.to_str().ok()?;
+    if !auth_header.starts_with("Bearer ") {
+        return None;
+    }
+    let token = &auth_header[7..];
+    let token_data = decode::<Claims>(
+        token,
+        &DecodingKey::from_secret(JWT_SECRET),
+        &Validation::default(),
+    ).ok()?;
+    Some(token_data.claims.sub)
 }
 
-#[derive(Deserialize)]
-pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct AuthResponse {
-    pub token: String,
-    pub user: AuthUserResponse,
-}
-
-#[derive(serde::Serialize)]
-pub struct AuthUserResponse {
-    pub id: String,
-    pub username: String,
-    pub email: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-}
-
-const JWT_SECRET: &[u8] = b"secret_key_change_me_in_production";
-
-pub fn routes(db: UserDb) -> Router {
+pub fn routes(db: Arc<Database>) -> Router {
     Router::new()
         .route("/register", post(register_handler))
         .route("/login", post(login_handler))
@@ -52,10 +39,10 @@ pub fn routes(db: UserDb) -> Router {
 }
 
 async fn register_handler(
-    axum::extract::State(db): axum::extract::State<UserDb>,
+    State(db): State<Arc<Database>>,
     Json(payload): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    let mut users = db.lock().unwrap();
+    let mut users = db.users.lock().unwrap();
 
     if users.values().any(|u| u.email == payload.email) {
         return (StatusCode::BAD_REQUEST, "Email already registered").into_response();
@@ -73,9 +60,9 @@ async fn register_handler(
         id: user_id.clone(),
         email: payload.email.clone(),
         password_hash: hashed_password,
-        name: payload.username.clone(), // Initialize name with username
-        avatar: "https://picsum.photos/id/64/200/200".to_string(), // Default avatar
-        gender: "other".to_string(), // Default gender
+        name: payload.username.clone(), 
+        avatar: "https://picsum.photos/id/64/200/200".to_string(), 
+        gender: "other".to_string(), 
         bio: "".to_string(),
         location: "".to_string(),
         posts: 0,
@@ -91,8 +78,9 @@ async fn register_handler(
     };
 
     users.insert(user_id.clone(), new_user);
+    drop(users);
+    db.save_all();
 
-    // Generate JWT for auto-login
     let expiration = Utc::now()
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
@@ -121,10 +109,10 @@ async fn register_handler(
 }
 
 async fn login_handler(
-    axum::extract::State(db): axum::extract::State<UserDb>,
+    State(db): State<Arc<Database>>,
     Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    let users = db.lock().unwrap();
+    let users = db.users.lock().unwrap();
     
     let user = match users.values().find(|u| u.email == payload.email) {
         Some(u) => u,
@@ -159,7 +147,7 @@ async fn login_handler(
         token,
         user: AuthUserResponse {
             id: user.id.clone(),
-            username: user.name.clone(), // using name as username for frontend compatibility
+            username: user.name.clone(), 
             email: user.email.clone(),
         },
     };

@@ -29,7 +29,7 @@ async fn main() {
         .route("/ws", get(social::ws_handler).with_state(db.clone()))
         .layer(cors);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8081));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8081));
     println!("Server running at http://{}", addr);
 
     let listener = TcpListener::bind(addr).await.unwrap();

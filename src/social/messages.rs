@@ -9,7 +9,7 @@ use futures_util::{StreamExt, SinkExt, stream::{SplitSink, SplitStream}};
 use tokio::sync::mpsc;
 use std::sync::Arc;
 use crate::database::Database;
-use crate::database::models::{Message, MessageType};
+use crate::database::models::{Message, MessageType, GroupMessage};
 use crate::social::WsPayload;
 
 pub async fn get_messages(
@@ -91,67 +91,88 @@ async fn handle_send_message(
     db: &Arc<Database>,
 ) {
     let now = Utc::now();
-    let msg = Message {
-        id: Uuid::new_v4(),
-        conversation_id: target_id,
-        sender_id: sender_user_id.to_string(),
-        reply_id,
-        content: content.clone(),
-        msg_type,
-        created_at: now,
-    };
-
+    let broadcast_msg: String;
     let mut broadcast_to = Vec::new();
 
     if is_group {
-        let mut db_groups = db.groups.lock().unwrap();
-        if let Some(_group) = db_groups.get_mut(&target_id) {
-            // Check membership
-            let db_members = db.group_members.lock().unwrap();
-            let members: Vec<String> = db_members.iter()
-                .filter(|m| m.group_id == target_id)
-                .map(|m| m.user_id.clone())
-                .collect();
-            
-            if !members.contains(&sender_user_id.to_string()) {
+        let msg = GroupMessage {
+            id: Uuid::new_v4(),
+            group_id: target_id,
+            sender_id: sender_user_id.to_string(),
+            reply_id,
+            content: content.clone(),
+            msg_type,
+            created_at: now,
+        };
+
+        // Check group and membership
+        {
+            let db_groups = db.groups.lock().unwrap();
+            if db_groups.contains_key(&target_id) {
+                 let db_members = db.group_members.lock().unwrap();
+                 let members: Vec<String> = db_members.iter()
+                    .filter(|m| m.group_id == target_id)
+                    .map(|m| m.user_id.clone())
+                    .collect();
+                 
+                 if !members.contains(&sender_user_id.to_string()) {
+                     return;
+                 }
+                 broadcast_to = members;
+            } else {
                 return;
             }
-            broadcast_to = members;
-            // Update group's last message if we had fields for it, 
-            // but Group model doesn't have it yet. Let's stick to user design.
-        } else {
-            return;
         }
+
+        {
+            let mut db_msgs = db.group_messages.lock().unwrap();
+            db_msgs.push(msg.clone());
+        }
+        db.save_all();
+        broadcast_msg = serde_json::to_string(&msg).unwrap();
+
     } else {
-        let mut db_convs = db.conversations.lock().unwrap();
-        if let Some(conv) = db_convs.get_mut(&target_id) {
-            let s = conv.sender.clone();
-            let r = conv.receiver.clone();
-            
-            let is_sender = s.as_deref() == Some(sender_user_id);
-            let is_receiver = r.as_deref() == Some(sender_user_id);
-            
-            if !is_sender && !is_receiver {
+        let msg = Message {
+            id: Uuid::new_v4(),
+            conversation_id: target_id,
+            sender_id: sender_user_id.to_string(),
+            reply_id,
+            content: content.clone(),
+            msg_type,
+            created_at: now,
+        };
+
+        {
+            let mut db_convs = db.conversations.lock().unwrap();
+            if let Some(conv) = db_convs.get_mut(&target_id) {
+                let s = conv.sender.clone();
+                let r = conv.receiver.clone();
+                
+                let is_sender = s.as_deref() == Some(sender_user_id);
+                let is_receiver = r.as_deref() == Some(sender_user_id);
+                
+                if !is_sender && !is_receiver {
+                    return;
+                }
+                
+                conv.last_message = content;
+                conv.last_message_at = now;
+                
+                if let Some(sid) = s { broadcast_to.push(sid); }
+                if let Some(rid) = r { broadcast_to.push(rid); }
+            } else {
                 return;
             }
-            
-            conv.last_message = content;
-            conv.last_message_at = now;
-            
-            if let Some(sid) = s { broadcast_to.push(sid); }
-            if let Some(rid) = r { broadcast_to.push(rid); }
-        } else {
-            return;
         }
+
+        {
+            let mut db_msgs = db.messages.lock().unwrap();
+            db_msgs.push(msg.clone());
+        }
+        db.save_all();
+        broadcast_msg = serde_json::to_string(&msg).unwrap();
     }
 
-    {
-        let mut db_msgs = db.messages.lock().unwrap();
-        db_msgs.push(msg.clone());
-    }
-    db.save_all();
-
-    let broadcast_msg = serde_json::to_string(&msg).unwrap();
     for p_id in broadcast_to {
         if let Some(p_tx) = db.conns.get(&p_id) {
             let _ = p_tx.send(WsMessage::Text(broadcast_msg.clone()));

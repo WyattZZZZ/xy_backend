@@ -222,6 +222,13 @@ pub struct CreateConversationRequest {
     pub receiver_id: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateGroupRequest {
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateGroupRequest {
@@ -246,6 +253,25 @@ pub enum WsPayload {
     RecallMessage {
         message_id: Uuid,
     },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMessage {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub sender_id: String,
+    pub reply_id: Option<Uuid>,
+    pub content: String,
+    pub msg_type: MessageType,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupMemberAction {
+    pub target_id: String,
+    pub leave: bool,
 }
 
 // --- Auth DTOs ---

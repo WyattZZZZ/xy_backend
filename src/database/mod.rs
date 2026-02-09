@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::fs;
 use serde_json;
-use crate::database::models::{User, Conversation, Message, Follow, Group, GroupMember};
+use crate::database::models::{User, Conversation, Message, Follow, Group, GroupMember, GroupMessage};
 use uuid::Uuid;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
@@ -18,6 +18,7 @@ pub struct Database {
     pub groups: Arc<Mutex<HashMap<Uuid, Group>>>,
     pub group_members: Arc<Mutex<Vec<GroupMember>>>,
     pub messages: Arc<Mutex<Vec<Message>>>,
+    pub group_messages: Arc<Mutex<Vec<GroupMessage>>>,
     pub follows: Arc<Mutex<Vec<Follow>>>,
     pub conns: ActiveConnections,
 }
@@ -30,6 +31,7 @@ impl Database {
             groups: Arc::new(Mutex::new(HashMap::new())),
             group_members: Arc::new(Mutex::new(Vec::new())),
             messages: Arc::new(Mutex::new(Vec::new())),
+            group_messages: Arc::new(Mutex::new(Vec::new())),
             follows: Arc::new(Mutex::new(Vec::new())),
             conns: Arc::new(DashMap::new()),
         };
@@ -61,6 +63,11 @@ impl Database {
         if let Ok(data) = fs::read_to_string("database/messages.json") {
             if let Ok(vec) = serde_json::from_str::<Vec<Message>>(&data) {
                 *self.messages.lock().unwrap() = vec;
+            }
+        }
+        if let Ok(data) = fs::read_to_string("database/group_messages.json") {
+            if let Ok(vec) = serde_json::from_str::<Vec<GroupMessage>>(&data) {
+                *self.group_messages.lock().unwrap() = vec;
             }
         }
         if let Ok(data) = fs::read_to_string("database/follows.json") {
@@ -96,6 +103,11 @@ impl Database {
         {
             let msgs = self.messages.lock().unwrap();
             let _ = fs::write("database/messages.json", serde_json::to_string_pretty(&*msgs).unwrap());
+        }
+
+        {
+            let group_msgs = self.group_messages.lock().unwrap();
+            let _ = fs::write("database/group_messages.json", serde_json::to_string_pretty(&*group_msgs).unwrap());
         }
         
         {

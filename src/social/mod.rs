@@ -35,9 +35,9 @@ pub fn conversation_routes(db: Arc<Database>) -> Router {
 pub fn group_routes(db: Arc<Database>) -> Router {
     Router::new()
         .route("/", post(groups::create_group).get(groups::get_groups))
-        .route("/:id", get(groups::get_group))
+        .route("/:id", get(groups::get_group).post(groups::handle_group_action).delete(groups::delete_group).put(groups::update_group_info))
         .route("/:id/members", get(groups::get_group_members))
-        .route("/:id/messages", get(messages::get_messages)) // Reusing messages handler
+        .route("/:id/message", get(groups::get_group_messages).post(groups::post_group_message))
         .with_state(db)
 }
 

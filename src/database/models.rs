@@ -274,6 +274,170 @@ pub struct GroupMemberAction {
     pub leave: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Product {
+    pub id: Uuid,
+    pub seller_id: String,
+    pub title: String,
+    pub description: String,
+    pub price: f64,
+    pub location: String,
+    pub coordinates: Option<Coordinates>,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub images: Vec<String>,
+    pub video: Option<String>,
+    pub condition: String,
+    pub status: ProductStatus,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Category {
+    pub category_id: String,
+    pub english: String,
+    pub chinese: String,
+    pub icon: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProductStatus {
+    Active,
+    Sold,
+    Delisted,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateProductRequest {
+    pub title: String,
+    pub description: String,
+    pub price: f64,
+    pub location: String,
+    pub coordinates: Option<Coordinates>,
+    pub category: String,
+    pub tags: Vec<String>,
+    pub images: Vec<String>,
+    pub condition: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductFilter {
+    pub category: Option<String>,
+    pub seller_id: Option<String>,
+    pub min_price: Option<f64>,
+    pub max_price: Option<f64>,
+    pub query: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub radius_km: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Post {
+    pub id: Uuid,
+    pub author_id: String,
+    pub title: String,
+    pub content: String,
+    pub category: String,
+    pub location: String,
+    pub tags: Vec<String>,
+    pub media: Vec<String>,
+    pub likes_count: i32,
+    pub comments_count: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatePostRequest {
+    pub title: String,
+    pub content: String,
+    pub category: String,
+    pub location: String,
+    pub tags: Vec<String>,
+    pub media: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PostLike {
+    pub post_id: Uuid,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PostComment {
+    pub id: Uuid,
+    pub post_id: Uuid,
+    pub user_id: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentResponse {
+    pub id: Uuid,
+    pub post_id: Uuid,
+    pub user_id: String,
+    pub user_name: String,
+    pub user_avatar: String,
+    pub content: String,
+    pub likes_count: i32,
+    pub is_liked: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CommentLike {
+    pub comment_id: Uuid,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostReplyRequest {
+    pub comment_id: Uuid,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCommentReply {
+    pub id: Uuid,
+    pub comment_id: Uuid,
+    pub post_id: Uuid,
+    pub user_id: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostCommentRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostFilter {
+    pub category: Option<String>,
+    pub author_id: Option<String>,
+    pub query: Option<String>,
+}
+
 // --- Auth DTOs ---
 
 #[derive(Deserialize)]

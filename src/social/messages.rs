@@ -9,8 +9,10 @@ use futures_util::{StreamExt, SinkExt, stream::{SplitSink, SplitStream}};
 use tokio::sync::mpsc;
 use std::sync::Arc;
 use crate::database::Database;
-use crate::database::models::{Message, MessageType, GroupMessage};
+use crate::database::models::{Message, MessageType, GroupMessage, Claims};
 use crate::social::WsPayload;
+use crate::verify::auth::JWT_SECRET;
+use jsonwebtoken::{decode, DecodingKey, Validation};
 
 pub async fn get_messages(
     Path(id): Path<Uuid>,
@@ -43,12 +45,24 @@ pub async fn handle_socket(
 
     while let Some(Ok(msg)) = receiver.next().await {
         if let WsMessage::Text(text) = msg {
+            // Check if authenticated
             if current_user_id.is_none() {
-                if let Ok(id) = serde_json::from_str::<String>(&text) {
-                     current_user_id = Some(id.clone());
-                     db.conns.insert(id, tx.clone());
+                // Expect first message to be JWT token
+                if let Ok(token) = serde_json::from_str::<String>(&text) {
+                    if let Ok(token_data) = decode::<Claims>(
+                        &token,
+                        &DecodingKey::from_secret(JWT_SECRET),
+                        &Validation::default(),
+                    ) {
+                        let id = token_data.claims.sub;
+                        current_user_id = Some(id.clone());
+                        db.conns.insert(id, tx.clone());
+                        println!("WebSocket authenticated for user: {}", current_user_id.as_ref().unwrap());
+                        continue;
+                    }
                 }
-                continue;
+                println!("WebSocket authentication failed");
+                break; // Close connection if auth fails
             }
 
             if let Ok(ws_payload) = serde_json::from_str::<WsPayload>(&text) {
@@ -129,7 +143,10 @@ async fn handle_send_message(
             db_msgs.push(msg.clone());
         }
         db.save_all();
-        broadcast_msg = serde_json::to_string(&msg).unwrap();
+        broadcast_msg = match serde_json::to_string(&msg) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
 
     } else {
         let msg = Message {
@@ -170,7 +187,10 @@ async fn handle_send_message(
             db_msgs.push(msg.clone());
         }
         db.save_all();
-        broadcast_msg = serde_json::to_string(&msg).unwrap();
+        broadcast_msg = match serde_json::to_string(&msg) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
     }
 
     for p_id in broadcast_to {
@@ -185,35 +205,44 @@ async fn handle_recall_message(
     msg_id: Uuid,
     db: &Arc<Database>,
 ) {
-    let mut db_msgs = db.messages.lock().unwrap();
-    let msg_idx = db_msgs.iter().position(|m| m.id == msg_id && m.sender_id == user_id);
-    
-    if let Some(idx) = msg_idx {
-        let msg = db_msgs.remove(idx);
-        let target_id = msg.conversation_id;
-        drop(db_msgs);
-        db.save_all();
-        
-        let mut broadcast_to = Vec::new();
-        
-        // Try to find if it's a group or DM
-        {
-            let db_groups = db.groups.lock().unwrap();
-            if db_groups.contains_key(&target_id) {
-                let db_members = db.group_members.lock().unwrap();
-                broadcast_to = db_members.iter()
-                    .filter(|m| m.group_id == target_id)
-                    .map(|m| m.user_id.clone())
-                    .collect();
-            } else {
-                let db_convs = db.conversations.lock().unwrap();
-                if let Some(conv) = db_convs.get(&target_id) {
-                    if let Some(s) = &conv.sender { broadcast_to.push(s.clone()); }
-                    if let Some(r) = &conv.receiver { broadcast_to.push(r.clone()); }
-                }
+    let mut broadcast_to = Vec::new();
+    let mut target_id = Uuid::nil();
+    let mut found = false;
+
+    // Check DMs
+    {
+        let mut db_msgs = db.messages.lock().unwrap();
+        if let Some(idx) = db_msgs.iter().position(|m| m.id == msg_id && m.sender_id == user_id) {
+            let msg = db_msgs.remove(idx);
+            target_id = msg.conversation_id;
+            found = true;
+            
+            let db_convs = db.conversations.lock().unwrap();
+            if let Some(conv) = db_convs.get(&target_id) {
+                if let Some(s) = &conv.sender { broadcast_to.push(s.clone()); }
+                if let Some(r) = &conv.receiver { broadcast_to.push(r.clone()); }
             }
         }
+    }
 
+    // Check Groups if not found in DMs
+    if !found {
+        let mut db_group_msgs = db.group_messages.lock().unwrap();
+        if let Some(idx) = db_group_msgs.iter().position(|m| m.id == msg_id && m.sender_id == user_id) {
+            let msg = db_group_msgs.remove(idx);
+            target_id = msg.group_id;
+            found = true;
+
+            let db_members = db.group_members.lock().unwrap();
+            broadcast_to = db_members.iter()
+                .filter(|m| m.group_id == target_id)
+                .map(|m| m.user_id.clone())
+                .collect();
+        }
+    }
+
+    if found {
+        db.save_all();
         let recall_notify = serde_json::json!({
             "type": "RECALL",
             "messageId": msg_id,

@@ -2,6 +2,9 @@ pub mod conversations;
 pub mod messages;
 pub mod follows;
 pub mod groups;
+pub mod products;
+pub mod categories;
+pub mod posts;
 
 use axum::{
     Router,
@@ -13,6 +16,7 @@ use axum::{
 use std::sync::Arc;
 use crate::database::Database;
 use crate::database::models::WsPayload;
+
 
 // 对应 /social 路由
 pub fn social_routes(db: Arc<Database>) -> Router {
@@ -38,6 +42,29 @@ pub fn group_routes(db: Arc<Database>) -> Router {
         .route("/:id", get(groups::get_group).post(groups::handle_group_action).delete(groups::delete_group).put(groups::update_group_info))
         .route("/:id/members", get(groups::get_group_members))
         .route("/:id/message", get(groups::get_group_messages).post(groups::post_group_message))
+        .with_state(db)
+}
+
+// 对应 /product 路由
+pub fn product_routes(db: Arc<Database>) -> Router {
+    Router::new()
+        .route("/", post(products::create_product).get(products::get_products))
+        .route("/:id", get(products::get_product).with_state(db.clone()).post(products::update_product).put(products::update_product).delete(products::delete_product))
+        .with_state(db)
+}
+
+
+// 对应 /post 路由
+pub fn post_routes(db: Arc<Database>) -> Router {
+    Router::new()
+        .route("/", post(posts::create_post).get(posts::get_posts))
+        .route("/:id", get(posts::get_post).put(posts::update_post).delete(posts::delete_post))
+        .route("/:id/like", post(posts::like_post).delete(posts::unlike_post).get(posts::get_post_like_status))
+        .route("/:id/comments", get(posts::get_post_comments).post(posts::add_comment))
+        .route("/:id/comments/:comment_id", post(posts::delete_comment).delete(posts::delete_comment))
+        .route("/:id/reply", post(posts::add_reply))
+        .route("/comment/:comment_id/like", post(posts::like_comment).delete(posts::unlike_comment))
+        .route("/comment/:comment_id/replies", get(posts::get_replies))
         .with_state(db)
 }
 

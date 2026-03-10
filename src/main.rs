@@ -3,7 +3,7 @@ mod user;
 mod social;
 mod database;
 
-use axum::{Router, routing::get};
+use axum::{Router, routing::get, extract::DefaultBodyLimit};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 use std::sync::Arc;
@@ -26,10 +26,14 @@ async fn main() {
         .nest("/social", social::social_routes(db.clone()))
         .nest("/conversation", social::conversation_routes(db.clone()))
         .nest("/group", social::group_routes(db.clone()))
+        .nest("/product", social::product_routes(db.clone()))
+        .route("/category", get(social::categories::get_categories).with_state(db.clone()))
+        .nest("/post", social::post_routes(db.clone()))
         .route("/ws", get(social::ws_handler).with_state(db.clone()))
+        .layer(DefaultBodyLimit::max(20 * 1024 * 1024))
         .layer(cors);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8081));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8090));
     println!("Server running at http://{}", addr);
 
     let listener = TcpListener::bind(addr).await.unwrap();

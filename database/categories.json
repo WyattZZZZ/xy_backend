@@ -1,0 +1,38 @@
+{
+  "home": {
+    "categoryId": "home",
+    "english": "Home & Garden",
+    "chinese": "家居园艺",
+    "icon": "home"
+  },
+  "job": {
+    "categoryId": "job",
+    "english": "Job",
+    "chinese": "招聘",
+    "icon": "work"
+  },
+  "fashion": {
+    "categoryId": "fashion",
+    "english": "Fashion",
+    "chinese": "时尚服装",
+    "icon": "apparel"
+  },
+  "rent": {
+    "categoryId": "rent",
+    "english": "Rent",
+    "chinese": "租房",
+    "icon": "apartment"
+  },
+  "electronics": {
+    "categoryId": "electronics",
+    "english": "Electronics",
+    "chinese": "电子产品",
+    "icon": "devices"
+  },
+  "motors": {
+    "categoryId": "motors",
+    "english": "Motors",
+    "chinese": "汽车配件",
+    "icon": "directions_car"
+  }
+}

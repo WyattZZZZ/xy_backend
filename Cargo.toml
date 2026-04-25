@@ -8,7 +8,6 @@ axum = { version = "0.7.5", features = ["ws"] }
 tokio = { version = "1.37.0", features = ["full"] }
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "1.0.115"
-ferris-says = "0.3.2"
 jsonwebtoken = "9.2"
 bcrypt = "0.15.1"
 chrono = { version = "0.4.37", features = ["serde"] }
@@ -16,3 +15,4 @@ uuid = { version = "1.8.0", features = ["v4", "serde"] }
 tower-http = { version = "0.6.8", features = ["cors"] }
 dashmap = "6.1.0"
 futures-util = { version = "0.3.31", features = ["sink"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono"] }

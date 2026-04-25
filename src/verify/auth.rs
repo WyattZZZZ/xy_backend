@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::http::HeaderMap;
 use crate::database::Database;
 use crate::database::models::{
-    User, Role, RegisterRequest, LoginRequest, AuthResponse, AuthUserResponse, Claims
+    RegisterRequest, LoginRequest, AuthResponse, AuthUserResponse, Claims, user_from_row,
 };
 
 pub const JWT_SECRET: &[u8] = b"secret_key_change_me_in_production";
@@ -42,88 +42,78 @@ async fn register_handler(
     State(db): State<Arc<Database>>,
     Json(payload): Json<RegisterRequest>,
 ) -> impl IntoResponse {
-    let mut users = db.users.lock().unwrap();
+    let existing = sqlx::query("SELECT id FROM users WHERE email = $1")
+        .bind(&payload.email)
+        .fetch_optional(&db.pool)
+        .await;
 
-    if users.values().any(|u| u.email == payload.email) {
-        return (StatusCode::BAD_REQUEST, "Email already registered").into_response();
+    match existing {
+        Ok(Some(_)) => return (StatusCode::BAD_REQUEST, "Email already registered").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+        Ok(None) => {}
     }
 
-    let hashed_password = match hash(payload.password, DEFAULT_COST) {
+    let hashed_password = match hash(&payload.password, DEFAULT_COST) {
         Ok(h) => h,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error hashing password").into_response(),
     };
 
     let user_id = uuid::Uuid::new_v4().to_string();
     let now = Utc::now();
+    let avatar = "https://picsum.photos/id/64/200/200".to_string();
 
-    let new_user = User {
-        id: user_id.clone(),
-        email: payload.email.clone(),
-        password_hash: hashed_password,
-        name: payload.username.clone(), 
-        avatar: "https://picsum.photos/id/64/200/200".to_string(), 
-        gender: "other".to_string(), 
-        bio: "".to_string(),
-        location: "".to_string(),
-        posts: 0,
-        following: 0,
-        fans: 0,
-        rating: 0.0,
-        reviews_count: 0,
-        coordinates: None,
-        is_verified: false,
-        role: Role::User,
-        created_at: now,
-        updated_at: now,
-    };
+    let result = sqlx::query(
+        "INSERT INTO users (id, email, password_hash, name, avatar, gender, bio, location, posts, following, fans, rating, reviews_count, is_verified, role, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, 'other', '', '', 0, 0, 0, 0.0, 0, FALSE, 'USER', $6, $6)"
+    )
+    .bind(&user_id)
+    .bind(&payload.email)
+    .bind(&hashed_password)
+    .bind(&payload.username)
+    .bind(&avatar)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
 
-    users.insert(user_id.clone(), new_user);
-    drop(users);
-    db.save_all();
+    if result.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Error creating user").into_response();
+    }
 
     let expiration = Utc::now()
         .checked_add_signed(Duration::hours(24))
         .expect("valid timestamp")
         .timestamp() as usize;
 
-    let claims = Claims {
-        sub: user_id.clone(),
-        exp: expiration,
-    };
-
+    let claims = Claims { sub: user_id.clone(), exp: expiration };
     let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(JWT_SECRET)) {
         Ok(t) => t,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error generating token").into_response(),
     };
 
-    let response = AuthResponse {
+    (StatusCode::CREATED, Json(AuthResponse {
         token,
-        user: AuthUserResponse {
-            id: user_id,
-            username: payload.username,
-            email: payload.email,
-        },
-    };
-
-    (StatusCode::CREATED, Json(response)).into_response()
+        user: AuthUserResponse { id: user_id, username: payload.username, email: payload.email },
+    })).into_response()
 }
 
 async fn login_handler(
     State(db): State<Arc<Database>>,
     Json(payload): Json<LoginRequest>,
 ) -> impl IntoResponse {
-    let users = db.users.lock().unwrap();
-    
-    let user = match users.values().find(|u| u.email == payload.email) {
-        Some(u) => u,
-        None => return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response(),
+    let row = sqlx::query("SELECT * FROM users WHERE email = $1")
+        .bind(&payload.email)
+        .fetch_optional(&db.pool)
+        .await;
+
+    let row = match row {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response(),
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
     };
 
-    let is_valid = match verify(payload.password, &user.password_hash) {
-        Ok(v) => v,
-        Err(_) => false,
-    };
+    let user = user_from_row(&row);
 
+    let is_valid = verify(&payload.password, &user.password_hash).unwrap_or(false);
     if !is_valid {
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
@@ -133,24 +123,14 @@ async fn login_handler(
         .expect("valid timestamp")
         .timestamp() as usize;
 
-    let claims = Claims {
-        sub: user.id.clone(),
-        exp: expiration,
-    };
-
+    let claims = Claims { sub: user.id.clone(), exp: expiration };
     let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(JWT_SECRET)) {
         Ok(t) => t,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Error generating token").into_response(),
     };
 
-    let response = AuthResponse {
+    (StatusCode::OK, Json(AuthResponse {
         token,
-        user: AuthUserResponse {
-            id: user.id.clone(),
-            username: user.name.clone(), 
-            email: user.email.clone(),
-        },
-    };
-
-    (StatusCode::OK, Json(response)).into_response()
+        user: AuthUserResponse { id: user.id.clone(), username: user.name.clone(), email: user.email.clone() },
+    })).into_response()
 }

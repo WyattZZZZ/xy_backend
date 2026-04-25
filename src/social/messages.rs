@@ -9,7 +9,7 @@ use futures_util::{StreamExt, SinkExt, stream::{SplitSink, SplitStream}};
 use tokio::sync::mpsc;
 use std::sync::Arc;
 use crate::database::Database;
-use crate::database::models::{Message, MessageType, GroupMessage, Claims};
+use crate::database::models::{MessageType, Claims, message_from_row, group_message_from_row, message_type_str};
 use crate::social::WsPayload;
 use crate::verify::auth::JWT_SECRET;
 use jsonwebtoken::{decode, DecodingKey, Validation};
@@ -18,18 +18,17 @@ pub async fn get_messages(
     Path(id): Path<Uuid>,
     State(db): State<Arc<Database>>,
 ) -> impl IntoResponse {
-    let db_msgs = db.messages.lock().unwrap();
-    let messages: Vec<Message> = db_msgs.iter()
-        .filter(|m| m.conversation_id == id)
-        .cloned()
-        .collect();
+    let rows = sqlx::query("SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC")
+        .bind(id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+    let messages: Vec<_> = rows.iter().map(|r| message_from_row(r)).collect();
     Json(messages)
 }
 
-pub async fn handle_socket(
-    socket: WebSocket,
-    db: Arc<Database>,
-) {
+pub async fn handle_socket(socket: WebSocket, db: Arc<Database>) {
     let (mut sender, mut receiver): (SplitSink<WebSocket, WsMessage>, SplitStream<WebSocket>) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
 
@@ -45,9 +44,7 @@ pub async fn handle_socket(
 
     while let Some(Ok(msg)) = receiver.next().await {
         if let WsMessage::Text(text) = msg {
-            // Check if authenticated
             if current_user_id.is_none() {
-                // Expect first message to be JWT token
                 if let Ok(token) = serde_json::from_str::<String>(&text) {
                     if let Ok(token_data) = decode::<Claims>(
                         &token,
@@ -57,12 +54,10 @@ pub async fn handle_socket(
                         let id = token_data.claims.sub;
                         current_user_id = Some(id.clone());
                         db.conns.insert(id, tx.clone());
-                        println!("WebSocket authenticated for user: {}", current_user_id.as_ref().unwrap());
                         continue;
                     }
                 }
-                println!("WebSocket authentication failed");
-                break; // Close connection if auth fails
+                break;
             }
 
             if let Ok(ws_payload) = serde_json::from_str::<WsPayload>(&text) {
@@ -70,20 +65,11 @@ pub async fn handle_socket(
                     WsPayload::SendMessage { target_id, is_group, content, msg_type, reply_id } => {
                         handle_send_message(
                             current_user_id.as_ref().unwrap(),
-                            target_id,
-                            is_group,
-                            content,
-                            msg_type,
-                            reply_id,
-                            &db
+                            target_id, is_group, content, msg_type, reply_id, &db,
                         ).await;
                     }
                     WsPayload::RecallMessage { message_id } => {
-                        handle_recall_message(
-                            current_user_id.as_ref().unwrap(),
-                            message_id,
-                            &db
-                        ).await;
+                        handle_recall_message(current_user_id.as_ref().unwrap(), message_id, &db).await;
                     }
                 }
             }
@@ -105,152 +91,162 @@ async fn handle_send_message(
     db: &Arc<Database>,
 ) {
     let now = Utc::now();
-    let broadcast_msg: String;
-    let mut broadcast_to = Vec::new();
+    let msg_type_s = message_type_str(&msg_type);
 
     if is_group {
-        let msg = GroupMessage {
-            id: Uuid::new_v4(),
-            group_id: target_id,
-            sender_id: sender_user_id.to_string(),
-            reply_id,
-            content: content.clone(),
-            msg_type,
-            created_at: now,
-        };
+        let is_member: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2)"
+        )
+        .bind(target_id)
+        .bind(sender_user_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or(false);
 
-        // Check group and membership
-        {
-            let db_groups = db.groups.lock().unwrap();
-            if db_groups.contains_key(&target_id) {
-                 let db_members = db.group_members.lock().unwrap();
-                 let members: Vec<String> = db_members.iter()
-                    .filter(|m| m.group_id == target_id)
-                    .map(|m| m.user_id.clone())
-                    .collect();
-                 
-                 if !members.contains(&sender_user_id.to_string()) {
-                     return;
-                 }
-                 broadcast_to = members;
-            } else {
-                return;
+        if !is_member { return; }
+
+        let msg_id = Uuid::new_v4();
+        let _ = sqlx::query(
+            "INSERT INTO group_messages (id, group_id, sender_id, reply_id, content, msg_type, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        )
+        .bind(msg_id)
+        .bind(target_id)
+        .bind(sender_user_id)
+        .bind(reply_id)
+        .bind(&content)
+        .bind(msg_type_s)
+        .bind(now)
+        .execute(&db.pool)
+        .await;
+
+        let broadcast_msg = serde_json::json!({
+            "id": msg_id, "groupId": target_id, "senderId": sender_user_id,
+            "replyId": reply_id, "content": content, "msgType": msg_type_s, "createdAt": now
+        }).to_string();
+
+        let member_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT user_id FROM group_members WHERE group_id = $1"
+        )
+        .bind(target_id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+        for pid in member_ids {
+            if let Some(p_tx) = db.conns.get(&pid) {
+                let _ = p_tx.send(WsMessage::Text(broadcast_msg.clone()));
             }
         }
-
-        {
-            let mut db_msgs = db.group_messages.lock().unwrap();
-            db_msgs.push(msg.clone());
-        }
-        db.save_all();
-        broadcast_msg = match serde_json::to_string(&msg) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
     } else {
-        let msg = Message {
-            id: Uuid::new_v4(),
-            conversation_id: target_id,
-            sender_id: sender_user_id.to_string(),
-            reply_id,
-            content: content.clone(),
-            msg_type,
-            created_at: now,
+        let row = sqlx::query("SELECT * FROM conversations WHERE id = $1")
+            .bind(target_id)
+            .fetch_optional(&db.pool)
+            .await;
+
+        let conv = match row.ok().flatten() {
+            Some(r) => crate::database::models::conversation_from_row(&r),
+            None => return,
         };
 
-        {
-            let mut db_convs = db.conversations.lock().unwrap();
-            if let Some(conv) = db_convs.get_mut(&target_id) {
-                let s = conv.sender.clone();
-                let r = conv.receiver.clone();
-                
-                let is_sender = s.as_deref() == Some(sender_user_id);
-                let is_receiver = r.as_deref() == Some(sender_user_id);
-                
-                if !is_sender && !is_receiver {
-                    return;
-                }
-                
-                conv.last_message = content;
-                conv.last_message_at = now;
-                
-                if let Some(sid) = s { broadcast_to.push(sid); }
-                if let Some(rid) = r { broadcast_to.push(rid); }
-            } else {
-                return;
+        let is_participant = conv.sender.as_deref() == Some(sender_user_id)
+            || conv.receiver.as_deref() == Some(sender_user_id);
+        if !is_participant { return; }
+
+        let msg_id = Uuid::new_v4();
+        let _ = sqlx::query(
+            "INSERT INTO messages (id, conversation_id, sender_id, reply_id, content, msg_type, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        )
+        .bind(msg_id)
+        .bind(target_id)
+        .bind(sender_user_id)
+        .bind(reply_id)
+        .bind(&content)
+        .bind(msg_type_s)
+        .bind(now)
+        .execute(&db.pool)
+        .await;
+
+        let _ = sqlx::query(
+            "UPDATE conversations SET last_message = $1, last_message_at = $2 WHERE id = $3"
+        )
+        .bind(&content)
+        .bind(now)
+        .bind(target_id)
+        .execute(&db.pool)
+        .await;
+
+        let broadcast_msg = serde_json::json!({
+            "id": msg_id, "conversationId": target_id, "senderId": sender_user_id,
+            "replyId": reply_id, "content": content, "msgType": msg_type_s, "createdAt": now
+        }).to_string();
+
+        for pid in [conv.sender, conv.receiver].into_iter().flatten() {
+            if let Some(p_tx) = db.conns.get(&pid) {
+                let _ = p_tx.send(WsMessage::Text(broadcast_msg.clone()));
             }
-        }
-
-        {
-            let mut db_msgs = db.messages.lock().unwrap();
-            db_msgs.push(msg.clone());
-        }
-        db.save_all();
-        broadcast_msg = match serde_json::to_string(&msg) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-    }
-
-    for p_id in broadcast_to {
-        if let Some(p_tx) = db.conns.get(&p_id) {
-            let _ = p_tx.send(WsMessage::Text(broadcast_msg.clone()));
         }
     }
 }
 
-async fn handle_recall_message(
-    user_id: &str,
-    msg_id: Uuid,
-    db: &Arc<Database>,
-) {
-    let mut broadcast_to = Vec::new();
-    let mut target_id = Uuid::nil();
-    let mut found = false;
+async fn handle_recall_message(user_id: &str, msg_id: Uuid, db: &Arc<Database>) {
+    // Try DM first
+    let row = sqlx::query("SELECT * FROM messages WHERE id = $1 AND sender_id = $2")
+        .bind(msg_id)
+        .bind(user_id)
+        .fetch_optional(&db.pool)
+        .await;
 
-    // Check DMs
-    {
-        let mut db_msgs = db.messages.lock().unwrap();
-        if let Some(idx) = db_msgs.iter().position(|m| m.id == msg_id && m.sender_id == user_id) {
-            let msg = db_msgs.remove(idx);
-            target_id = msg.conversation_id;
-            found = true;
-            
-            let db_convs = db.conversations.lock().unwrap();
-            if let Some(conv) = db_convs.get(&target_id) {
-                if let Some(s) = &conv.sender { broadcast_to.push(s.clone()); }
-                if let Some(r) = &conv.receiver { broadcast_to.push(r.clone()); }
-            }
-        }
-    }
+    if let Ok(Some(r)) = row {
+        let msg = message_from_row(&r);
+        let _ = sqlx::query("DELETE FROM messages WHERE id = $1").bind(msg_id).execute(&db.pool).await;
 
-    // Check Groups if not found in DMs
-    if !found {
-        let mut db_group_msgs = db.group_messages.lock().unwrap();
-        if let Some(idx) = db_group_msgs.iter().position(|m| m.id == msg_id && m.sender_id == user_id) {
-            let msg = db_group_msgs.remove(idx);
-            target_id = msg.group_id;
-            found = true;
+        let conv_row = sqlx::query("SELECT * FROM conversations WHERE id = $1")
+            .bind(msg.conversation_id)
+            .fetch_optional(&db.pool)
+            .await;
 
-            let db_members = db.group_members.lock().unwrap();
-            broadcast_to = db_members.iter()
-                .filter(|m| m.group_id == target_id)
-                .map(|m| m.user_id.clone())
-                .collect();
-        }
-    }
-
-    if found {
-        db.save_all();
         let recall_notify = serde_json::json!({
-            "type": "RECALL",
-            "messageId": msg_id,
-            "targetId": target_id
+            "type": "RECALL", "messageId": msg_id, "targetId": msg.conversation_id
         }).to_string();
 
-        for p_id in broadcast_to {
-            if let Some(p_tx) = db.conns.get(&p_id) {
+        if let Ok(Some(cr)) = conv_row {
+            let conv = crate::database::models::conversation_from_row(&cr);
+            for pid in [conv.sender, conv.receiver].into_iter().flatten() {
+                if let Some(p_tx) = db.conns.get(&pid) {
+                    let _ = p_tx.send(WsMessage::Text(recall_notify.clone()));
+                }
+            }
+        }
+        return;
+    }
+
+    // Try group
+    let row = sqlx::query("SELECT * FROM group_messages WHERE id = $1 AND sender_id = $2")
+        .bind(msg_id)
+        .bind(user_id)
+        .fetch_optional(&db.pool)
+        .await;
+
+    if let Ok(Some(r)) = row {
+        let msg = group_message_from_row(&r);
+        let _ = sqlx::query("DELETE FROM group_messages WHERE id = $1").bind(msg_id).execute(&db.pool).await;
+
+        let member_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT user_id FROM group_members WHERE group_id = $1"
+        )
+        .bind(msg.group_id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+        let recall_notify = serde_json::json!({
+            "type": "RECALL", "messageId": msg_id, "targetId": msg.group_id
+        }).to_string();
+
+        for pid in member_ids {
+            if let Some(p_tx) = db.conns.get(&pid) {
                 let _ = p_tx.send(WsMessage::Text(recall_notify.clone()));
             }
         }

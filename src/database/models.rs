@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
+use sqlx::postgres::PgRow;
+use sqlx::Row;
 
 // --- Core Models (Tables) ---
 
@@ -395,6 +397,19 @@ pub struct CommentResponse {
     pub content: String,
     pub likes_count: i32,
     pub is_liked: bool,
+    pub replies: Vec<ReplyResponse>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyResponse {
+    pub id: Uuid,
+    pub comment_id: Uuid,
+    pub user_id: String,
+    pub user_name: String,
+    pub user_avatar: String,
+    pub content: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -421,6 +436,22 @@ pub struct PostCommentReply {
     pub post_id: Uuid,
     pub user_id: String,
     pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductFavorite {
+    pub product_id: Uuid,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PostFavorite {
+    pub post_id: Uuid,
+    pub user_id: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -483,4 +514,183 @@ pub struct ChatListItem {
 pub struct Claims {
     pub sub: String,
     pub exp: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Report {
+    pub id: Uuid,
+    pub target_id: String,
+    pub target_type: String, // "post" or "product"
+    pub reason: String,
+    pub details: Option<String>,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateReportRequest {
+    pub target_id: String,
+    pub target_type: String,
+    pub reason: String,
+    pub details: Option<String>,
+}
+
+// --- DB Row helpers ---
+
+pub fn user_from_row(row: &PgRow) -> User {
+    let lat: Option<f64> = row.get("lat");
+    let lng: Option<f64> = row.get("lng");
+    let role_str: String = row.get("role");
+    User {
+        id: row.get("id"),
+        email: row.get("email"),
+        password_hash: row.get("password_hash"),
+        name: row.get("name"),
+        avatar: row.get("avatar"),
+        gender: row.get("gender"),
+        bio: row.get("bio"),
+        location: row.get("location"),
+        posts: row.get("posts"),
+        following: row.get("following"),
+        fans: row.get("fans"),
+        rating: row.get("rating"),
+        reviews_count: row.get("reviews_count"),
+        coordinates: match (lat, lng) {
+            (Some(lat), Some(lng)) => Some(Coordinates { lat, lng }),
+            _ => None,
+        },
+        is_verified: row.get("is_verified"),
+        role: if role_str == "ADMIN" { Role::Admin } else { Role::User },
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+pub fn conversation_from_row(row: &PgRow) -> Conversation {
+    Conversation {
+        id: row.get("id"),
+        sender: row.get("sender"),
+        receiver: row.get("receiver"),
+        muteby: row.get::<i16, _>("muteby") as i8,
+        last_message: row.get("last_message"),
+        last_message_at: row.get("last_message_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+pub fn group_from_row(row: &PgRow) -> Group {
+    Group {
+        id: row.get("id"),
+        creator_id: row.get("creator_id"),
+        avatar: row.get("avatar"),
+        max_member: row.get("max_member"),
+        member_num: row.get("member_num"),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+    }
+}
+
+pub fn group_member_from_row(row: &PgRow) -> GroupMember {
+    let role_str: String = row.get("role");
+    GroupMember {
+        group_id: row.get("group_id"),
+        user_id: row.get("user_id"),
+        join_time: row.get("join_time"),
+        role: if role_str == "ADMIN" { GroupRole::Admin } else { GroupRole::Normal },
+        mute_until: row.get("mute_until"),
+        is_muted: row.get("is_muted"),
+    }
+}
+
+pub fn message_from_row(row: &PgRow) -> Message {
+    let msg_type_str: String = row.get("msg_type");
+    Message {
+        id: row.get("id"),
+        conversation_id: row.get("conversation_id"),
+        sender_id: row.get("sender_id"),
+        reply_id: row.get("reply_id"),
+        content: row.get("content"),
+        msg_type: parse_message_type(&msg_type_str),
+        created_at: row.get("created_at"),
+    }
+}
+
+pub fn group_message_from_row(row: &PgRow) -> GroupMessage {
+    let msg_type_str: String = row.get("msg_type");
+    GroupMessage {
+        id: row.get("id"),
+        group_id: row.get("group_id"),
+        sender_id: row.get("sender_id"),
+        reply_id: row.get("reply_id"),
+        content: row.get("content"),
+        msg_type: parse_message_type(&msg_type_str),
+        created_at: row.get("created_at"),
+    }
+}
+
+pub fn product_from_row(row: &PgRow) -> Product {
+    let lat: Option<f64> = row.get("lat");
+    let lng: Option<f64> = row.get("lng");
+    let status_str: String = row.get("status");
+    Product {
+        id: row.get("id"),
+        seller_id: row.get("seller_id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        price: row.get("price"),
+        location: row.get("location"),
+        coordinates: match (lat, lng) {
+            (Some(lat), Some(lng)) => Some(Coordinates { lat, lng }),
+            _ => None,
+        },
+        category: row.get("category"),
+        tags: row.get("tags"),
+        images: row.get("images"),
+        video: row.get("video"),
+        condition: row.get("condition"),
+        status: match status_str.as_str() {
+            "SOLD" => ProductStatus::Sold,
+            "DELISTED" => ProductStatus::Delisted,
+            _ => ProductStatus::Active,
+        },
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+pub fn post_from_row(row: &PgRow) -> Post {
+    Post {
+        id: row.get("id"),
+        author_id: row.get("author_id"),
+        title: row.get("title"),
+        content: row.get("content"),
+        category: row.get("category"),
+        location: row.get("location"),
+        tags: row.get("tags"),
+        media: row.get("media"),
+        likes_count: row.get("likes_count"),
+        comments_count: row.get("comments_count"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+pub fn parse_message_type(s: &str) -> MessageType {
+    match s {
+        "IMAGE" => MessageType::Image,
+        "VOICE" => MessageType::Voice,
+        "VIDEO" => MessageType::Video,
+        "PRODUCT_SHARE" => MessageType::ProductShare,
+        _ => MessageType::Text,
+    }
+}
+
+pub fn message_type_str(t: &MessageType) -> &'static str {
+    match t {
+        MessageType::Text => "TEXT",
+        MessageType::Image => "IMAGE",
+        MessageType::Voice => "VOICE",
+        MessageType::Video => "VIDEO",
+        MessageType::ProductShare => "PRODUCT_SHARE",
+    }
 }

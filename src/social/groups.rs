@@ -9,7 +9,11 @@ use uuid::Uuid;
 use chrono::Utc;
 use std::sync::Arc;
 use crate::database::Database;
-use crate::database::models::{Group, GroupMember, GroupRole, CreateGroupRequest, ChatListItem, GroupFilter, GroupMessage, GroupMemberAction};
+use crate::database::models::{
+    ChatListItem, GroupFilter, GroupMemberAction, UpdateGroupRequest,
+    CreateGroupRequest, group_from_row, group_member_from_row, group_message_from_row,
+    MessageType, message_type_str,
+};
 use crate::verify::auth::get_user_id_from_token;
 
 pub async fn create_group(
@@ -23,49 +27,51 @@ pub async fn create_group(
     };
     let now = Utc::now();
     let group_id = Uuid::new_v4();
+    let avatar = req.avatar.unwrap_or_else(|| "https://picsum.photos/seed/group/200/200".to_string());
+    let member_num = (req.participants.len() + 1) as i32;
 
-    let group = Group {
-        id: group_id,
-        creator_id: authenticated_id.clone(),
-        avatar: req.avatar.unwrap_or_else(|| "https://picsum.photos/seed/group/200/200".to_string()),
-        max_member: 100,
-        member_num: (req.participants.len() + 1) as i32,
-        name: req.name,
-        created_at: now,
-    };
+    let result = sqlx::query(
+        "INSERT INTO groups (id, creator_id, avatar, max_member, member_num, name, created_at)
+         VALUES ($1, $2, $3, 100, $4, $5, $6)"
+    )
+    .bind(group_id)
+    .bind(&authenticated_id)
+    .bind(&avatar)
+    .bind(member_num)
+    .bind(&req.name)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
 
-    let mut members = Vec::new();
-    // Add creator
-    members.push(GroupMember {
-        group_id,
-        user_id: authenticated_id,
-        join_time: now,
-        role: GroupRole::Admin,
-        mute_until: None,
-        is_muted: false,
-    });
-
-    // Add other participants
-    for uid in req.participants {
-        members.push(GroupMember {
-            group_id,
-            user_id: uid,
-            join_time: now,
-            role: GroupRole::Normal,
-            mute_until: None,
-            is_muted: false,
-        });
+    if result.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
     }
 
-    {
-        let mut db_groups = db.groups.lock().unwrap();
-        db_groups.insert(group_id, group.clone());
-        let mut db_members = db.group_members.lock().unwrap();
-        db_members.extend(members);
-    }
-    db.save_all();
+    let _ = sqlx::query(
+        "INSERT INTO group_members (group_id, user_id, join_time, role, is_muted) VALUES ($1, $2, $3, 'ADMIN', FALSE)"
+    )
+    .bind(group_id)
+    .bind(&authenticated_id)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
 
-    (StatusCode::CREATED, Json(group)).into_response()
+    for uid in &req.participants {
+        let _ = sqlx::query(
+            "INSERT INTO group_members (group_id, user_id, join_time, role, is_muted) VALUES ($1, $2, $3, 'NORMAL', FALSE)"
+        )
+        .bind(group_id)
+        .bind(uid)
+        .bind(now)
+        .execute(&db.pool)
+        .await;
+    }
+
+    let row = sqlx::query("SELECT * FROM groups WHERE id = $1").bind(group_id).fetch_one(&db.pool).await;
+    match row {
+        Ok(r) => (StatusCode::CREATED, Json(group_from_row(&r))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    }
 }
 
 pub async fn get_groups(
@@ -73,43 +79,50 @@ pub async fn get_groups(
     headers: HeaderMap,
     Query(filter): Query<GroupFilter>,
 ) -> impl IntoResponse {
-    let user_id = filter.user_id.or_else(|| get_user_id_from_token(&headers)).unwrap_or_else(|| "test_user".to_string());
-    let db_members = db.group_members.lock().unwrap();
-    let group_ids: Vec<Uuid> = db_members.iter()
-        .filter(|m| m.user_id == user_id)
-        .map(|m| m.group_id)
-        .collect();
-    drop(db_members);
+    let user_id = filter.user_id
+        .or_else(|| get_user_id_from_token(&headers))
+        .unwrap_or_else(|| "test_user".to_string());
 
-    let db_groups = db.groups.lock().unwrap();
-    let my_groups: Vec<ChatListItem> = group_ids.iter()
-        .filter_map(|gid| {
-            db_groups.get(gid).map(|g| {
-                ChatListItem {
-                    id: g.id,
-                    name: g.name.clone(),
-                    avatar: g.avatar.clone(),
-                    last_msg: "Group Chat".to_string(), // Placeholder
-                    time: g.created_at.format("%H:%M").to_string(),
-                    unread: false,
-                    is_group: true,
-                    other_user_id: None,
-                }
-            })
-        })
-        .collect();
+    let rows = sqlx::query(
+        "SELECT g.* FROM groups g
+         JOIN group_members gm ON g.id = gm.group_id
+         WHERE gm.user_id = $1"
+    )
+    .bind(&user_id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
 
-    Json(my_groups).into_response()
+    let items: Vec<ChatListItem> = rows.iter().map(|r| {
+        let g = group_from_row(r);
+        ChatListItem {
+            id: g.id,
+            name: g.name,
+            avatar: g.avatar,
+            last_msg: "Group Chat".to_string(),
+            time: g.created_at.format("%H:%M").to_string(),
+            unread: false,
+            is_group: true,
+            other_user_id: None,
+        }
+    }).collect();
+
+    Json(items).into_response()
 }
 
 pub async fn get_group(
     Path(id): Path<Uuid>,
     State(db): State<Arc<Database>>,
 ) -> impl IntoResponse {
-    let db_groups = db.groups.lock().unwrap();
-    match db_groups.get(&id) {
-        Some(g) => Json(Some(g.clone())).into_response(),
-        None => (StatusCode::NOT_FOUND, "Group not found").into_response(),
+    let row = sqlx::query("SELECT * FROM groups WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&db.pool)
+        .await;
+
+    match row {
+        Ok(Some(r)) => Json(Some(group_from_row(&r))).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Group not found").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
     }
 }
 
@@ -117,11 +130,13 @@ pub async fn get_group_members(
     Path(id): Path<Uuid>,
     State(db): State<Arc<Database>>,
 ) -> impl IntoResponse {
-    let db_members = db.group_members.lock().unwrap();
-    let members: Vec<GroupMember> = db_members.iter()
-        .filter(|m| m.group_id == id)
-        .cloned()
-        .collect();
+    let rows = sqlx::query("SELECT * FROM group_members WHERE group_id = $1")
+        .bind(id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+    let members: Vec<_> = rows.iter().map(|r| group_member_from_row(r)).collect();
     Json(members).into_response()
 }
 
@@ -129,7 +144,7 @@ pub async fn get_group_members(
 #[serde(rename_all = "camelCase")]
 pub struct CreateGroupMessageRequest {
     pub content: String,
-    pub msg_type: crate::database::models::MessageType,
+    pub msg_type: MessageType,
     pub reply_id: Option<Uuid>,
 }
 
@@ -144,33 +159,46 @@ pub async fn post_group_message(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    // Verify membership
-    let is_member = {
-        let members = db.group_members.lock().unwrap();
-        members.iter().any(|m| m.group_id == id && m.user_id == authenticated_id)
-    };
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2)"
+    )
+    .bind(id)
+    .bind(&authenticated_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap_or(false);
 
     if !is_member {
         return (StatusCode::FORBIDDEN, "Not a member of this group").into_response();
     }
 
-    let msg = GroupMessage {
-        id: Uuid::new_v4(),
-        group_id: id,
-        sender_id: authenticated_id,
-        reply_id: req.reply_id,
-        content: req.content,
-        msg_type: req.msg_type,
-        created_at: Utc::now(),
-    };
+    let msg_id = Uuid::new_v4();
+    let now = Utc::now();
+    let msg_type_s = message_type_str(&req.msg_type);
 
-    {
-        let mut group_msgs = db.group_messages.lock().unwrap();
-        group_msgs.push(msg.clone());
+    let result = sqlx::query(
+        "INSERT INTO group_messages (id, group_id, sender_id, reply_id, content, msg_type, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+    )
+    .bind(msg_id)
+    .bind(id)
+    .bind(&authenticated_id)
+    .bind(req.reply_id)
+    .bind(&req.content)
+    .bind(msg_type_s)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
+
+    if result.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
     }
-    db.save_all();
 
-    (StatusCode::CREATED, Json(msg)).into_response()
+    let row = sqlx::query("SELECT * FROM group_messages WHERE id = $1").bind(msg_id).fetch_one(&db.pool).await;
+    match row {
+        Ok(r) => (StatusCode::CREATED, Json(group_message_from_row(&r))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    }
 }
 
 pub async fn get_group_messages(
@@ -183,24 +211,26 @@ pub async fn get_group_messages(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    // Verify membership
-    let is_member = {
-        let members = db.group_members.lock().unwrap();
-        members.iter().any(|m| m.group_id == id && m.user_id == authenticated_id)
-    };
+    let is_member: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2)"
+    )
+    .bind(id)
+    .bind(&authenticated_id)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap_or(false);
 
     if !is_member {
         return (StatusCode::FORBIDDEN, "Not a member of this group").into_response();
     }
 
-    let msgs = {
-        let group_msgs = db.group_messages.lock().unwrap();
-        group_msgs.iter()
-            .filter(|m| m.group_id == id)
-            .cloned()
-            .collect::<Vec<_>>()
-    };
+    let rows = sqlx::query("SELECT * FROM group_messages WHERE group_id = $1 ORDER BY created_at ASC")
+        .bind(id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
 
+    let msgs: Vec<_> = rows.iter().map(|r| group_message_from_row(r)).collect();
     Json(msgs).into_response()
 }
 
@@ -215,58 +245,53 @@ pub async fn handle_group_action(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    let mut members = db.group_members.lock().unwrap();
-    
-    // Check requester role
-    let requester_role = members.iter()
-        .find(|m| m.group_id == id && m.user_id == authenticated_id)
-        .map(|m| m.role);
+    let requester_role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM group_members WHERE group_id = $1 AND user_id = $2"
+    )
+    .bind(id)
+    .bind(&authenticated_id)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap_or(None);
 
     if requester_role.is_none() {
         return (StatusCode::FORBIDDEN, "Not a member").into_response();
     }
-    let is_admin = requester_role == Some(GroupRole::Admin);
+    let is_admin = requester_role.as_deref() == Some("ADMIN");
 
     if action.leave {
-        // Leave or Kick
         if action.target_id == authenticated_id {
-            // Self leave
-            members.retain(|m| !(m.group_id == id && m.user_id == authenticated_id));
+            let _ = sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND user_id = $2")
+                .bind(id).bind(&authenticated_id).execute(&db.pool).await;
         } else {
-            // Kick
             if !is_admin {
                 return (StatusCode::FORBIDDEN, "Only admin can remove members").into_response();
             }
-            members.retain(|m| !(m.group_id == id && m.user_id == action.target_id));
+            let _ = sqlx::query("DELETE FROM group_members WHERE group_id = $1 AND user_id = $2")
+                .bind(id).bind(&action.target_id).execute(&db.pool).await;
         }
     } else {
-        // Invite
-        // Check if already member
-        if members.iter().any(|m| m.group_id == id && m.user_id == action.target_id) {
+        let already: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2)"
+        )
+        .bind(id).bind(&action.target_id)
+        .fetch_one(&db.pool).await.unwrap_or(false);
+
+        if already {
             return (StatusCode::CONFLICT, "User already in group").into_response();
         }
-        
-        members.push(GroupMember {
-            group_id: id,
-            user_id: action.target_id.clone(),
-            join_time: Utc::now(),
-            role: GroupRole::Normal,
-            mute_until: None,
-            is_muted: false,
-        });
+        let _ = sqlx::query(
+            "INSERT INTO group_members (group_id, user_id, join_time, role, is_muted) VALUES ($1, $2, $3, 'NORMAL', FALSE)"
+        )
+        .bind(id).bind(&action.target_id).bind(Utc::now())
+        .execute(&db.pool).await;
     }
 
-    // Update member count in group
-    let count = members.iter().filter(|m| m.group_id == id).count() as i32;
-    drop(members); // unlock before locking groups
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM group_members WHERE group_id = $1")
+        .bind(id).fetch_one(&db.pool).await.unwrap_or(0);
 
-    {
-        let mut groups = db.groups.lock().unwrap();
-        if let Some(g) = groups.get_mut(&id) {
-            g.member_num = count;
-        }
-    }
-    db.save_all();
+    let _ = sqlx::query("UPDATE groups SET member_num = $1 WHERE id = $2")
+        .bind(count as i32).bind(id).execute(&db.pool).await;
 
     (StatusCode::OK, "Action successful").into_response()
 }
@@ -281,36 +306,18 @@ pub async fn delete_group(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    // Verify admin
-    let is_admin = {
-        let members = db.group_members.lock().unwrap();
-        members.iter().any(|m| m.group_id == id && m.user_id == authenticated_id && m.role == GroupRole::Admin)
-    };
+    let is_admin: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2 AND role = 'ADMIN')"
+    )
+    .bind(id).bind(&authenticated_id)
+    .fetch_one(&db.pool).await.unwrap_or(false);
 
     if !is_admin {
         return (StatusCode::FORBIDDEN, "Only admin can delete group").into_response();
     }
 
-    // Delete group
-    {
-        let mut groups = db.groups.lock().unwrap();
-        groups.remove(&id);
-    }
-    
-    // Delete members
-    {
-        let mut members = db.group_members.lock().unwrap();
-        members.retain(|m| m.group_id != id);
-    }
-
-    // Delete messages
-    {
-        let mut msgs = db.group_messages.lock().unwrap();
-        msgs.retain(|m| m.group_id != id);
-    }
-
-    db.save_all();
-
+    // Cascade deletes group_members and group_messages via FK
+    let _ = sqlx::query("DELETE FROM groups WHERE id = $1").bind(id).execute(&db.pool).await;
     (StatusCode::OK, "Group disbanded").into_response()
 }
 
@@ -318,42 +325,44 @@ pub async fn update_group_info(
     Path(id): Path<Uuid>,
     State(db): State<Arc<Database>>,
     headers: HeaderMap,
-    Json(req): Json<crate::database::models::UpdateGroupRequest>,
+    Json(req): Json<UpdateGroupRequest>,
 ) -> impl IntoResponse {
     let authenticated_id = match get_user_id_from_token(&headers) {
         Some(uid) => uid,
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    // Check if user is admin
-    let is_admin = {
-        let members = db.group_members.lock().unwrap();
-        members.iter().any(|m| m.group_id == id && m.user_id == authenticated_id && m.role == GroupRole::Admin)
-    };
+    let is_admin: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM group_members WHERE group_id = $1 AND user_id = $2 AND role = 'ADMIN')"
+    )
+    .bind(id).bind(&authenticated_id)
+    .fetch_one(&db.pool).await.unwrap_or(false);
 
     if !is_admin {
         return (StatusCode::FORBIDDEN, "Only admins can update group info").into_response();
     }
 
-    let result = {
-        let mut groups = db.groups.lock().unwrap();
-        if let Some(group) = groups.get_mut(&id) {
-            if let Some(name) = req.name {
-                group.name = name;
+    let result = sqlx::query(
+        "UPDATE groups SET
+            name = COALESCE($1, name),
+            avatar = COALESCE($2, avatar)
+         WHERE id = $3"
+    )
+    .bind(req.name)
+    .bind(req.avatar)
+    .bind(id)
+    .execute(&db.pool)
+    .await;
+
+    match result {
+        Ok(r) if r.rows_affected() == 0 => (StatusCode::NOT_FOUND, "Group not found").into_response(),
+        Ok(_) => {
+            let row = sqlx::query("SELECT * FROM groups WHERE id = $1").bind(id).fetch_one(&db.pool).await;
+            match row {
+                Ok(r) => (StatusCode::OK, Json(group_from_row(&r))).into_response(),
+                Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
             }
-            if let Some(avatar) = req.avatar {
-                group.avatar = avatar;
-            }
-            Some(group.clone())
-        } else {
-            None
         }
-    };
-
-    if let Some(group) = result {
-        db.save_all();
-        return (StatusCode::OK, Json(group)).into_response();
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
     }
-
-    (StatusCode::NOT_FOUND, "Group not found").into_response()
 }

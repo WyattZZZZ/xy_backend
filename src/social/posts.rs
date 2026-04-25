@@ -8,23 +8,8 @@ use uuid::Uuid;
 use chrono::Utc;
 use std::sync::Arc;
 use crate::database::Database;
-use crate::database::models::{Post, CreatePostRequest, PostFilter};
+use crate::database::models::{CreatePostRequest, PostFilter, post_from_row};
 use crate::verify::auth::get_user_id_from_token;
-
-// Return whether the current user has liked a given post
-pub async fn get_post_like_status(
-    Path(id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let authenticated_id = match get_user_id_from_token(&headers) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-    let likes = db.post_likes.lock().unwrap();
-    let is_liked = likes.iter().any(|l| l.post_id == id && l.user_id == authenticated_id);
-    Json(serde_json::json!({ "isLiked": is_liked })).into_response()
-}
 
 pub async fn create_post(
     State(db): State<Arc<Database>>,
@@ -35,41 +20,40 @@ pub async fn create_post(
         Some(uid) => uid,
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
-    
+
     let now = Utc::now();
     let post_id = Uuid::new_v4();
 
-    let post = Post {
-        id: post_id,
-        author_id: authenticated_id.clone(),
-        title: req.title,
-        content: req.content,
-        category: req.category,
-        location: req.location,
-        tags: req.tags,
-        media: req.media,
-        likes_count: 0,
-        comments_count: 0,
-        created_at: now,
-        updated_at: now,
-    };
+    let result = sqlx::query(
+        "INSERT INTO posts (id, author_id, title, content, category, location, tags, media, likes_count, comments_count, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, 0, $9, $9)"
+    )
+    .bind(post_id)
+    .bind(&authenticated_id)
+    .bind(&req.title)
+    .bind(&req.content)
+    .bind(&req.category)
+    .bind(&req.location)
+    .bind(&req.tags)
+    .bind(&req.media)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
 
-    {
-        let mut posts = db.posts.lock().unwrap();
-        posts.insert(post_id, post.clone());
+    if result.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
     }
-    
-    // Increment user post count
-    {
-        let mut users = db.users.lock().unwrap();
-        if let Some(user) = users.get_mut(&authenticated_id) {
-            user.posts += 1;
-        }
-    }
-    
-    db.save_all();
 
-    (StatusCode::CREATED, Json(post)).into_response()
+    let _ = sqlx::query("UPDATE users SET posts = posts + 1 WHERE id = $1")
+        .bind(&authenticated_id)
+        .execute(&db.pool)
+        .await;
+
+    let row = sqlx::query("SELECT * FROM posts WHERE id = $1").bind(post_id).fetch_one(&db.pool).await;
+    match row {
+        Ok(r) => (StatusCode::CREATED, Json(post_from_row(&r))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    }
 }
 
 pub async fn update_post(
@@ -83,26 +67,26 @@ pub async fn update_post(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    let mut posts = db.posts.lock().unwrap();
-    if let Some(post) = posts.get_mut(&id) {
-        if post.author_id != authenticated_id {
-            return (StatusCode::FORBIDDEN, "Not your post").into_response();
-        }
-        
-        post.title = req.title;
-        post.content = req.content;
-        post.category = req.category;
-        post.location = req.location;
-        post.tags = req.tags;
-        post.media = req.media;
-        post.updated_at = Utc::now();
-        
-        let updated_post = post.clone();
-        drop(posts);
-        db.save_all();
-        (StatusCode::OK, Json(updated_post)).into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Post not found").into_response()
+    let author: Option<String> = sqlx::query_scalar("SELECT author_id FROM posts WHERE id = $1")
+        .bind(id).fetch_optional(&db.pool).await.unwrap_or(None);
+
+    match author {
+        None => return (StatusCode::NOT_FOUND, "Post not found").into_response(),
+        Some(aid) if aid != authenticated_id => return (StatusCode::FORBIDDEN, "Not your post").into_response(),
+        _ => {}
+    }
+
+    let _ = sqlx::query(
+        "UPDATE posts SET title=$1, content=$2, category=$3, location=$4, tags=$5, media=$6, updated_at=$7 WHERE id=$8"
+    )
+    .bind(&req.title).bind(&req.content).bind(&req.category).bind(&req.location)
+    .bind(&req.tags).bind(&req.media).bind(Utc::now()).bind(id)
+    .execute(&db.pool).await;
+
+    let row = sqlx::query("SELECT * FROM posts WHERE id = $1").bind(id).fetch_one(&db.pool).await;
+    match row {
+        Ok(r) => (StatusCode::OK, Json(post_from_row(&r))).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
     }
 }
 
@@ -110,40 +94,40 @@ pub async fn get_posts(
     State(db): State<Arc<Database>>,
     Query(filter): Query<PostFilter>,
 ) -> impl IntoResponse {
-    let posts_map = db.posts.lock().unwrap();
-    let mut posts: Vec<Post> = posts_map.values()
-        .filter(|p| {
-            if let Some(cat) = &filter.category {
-                if p.category != *cat { return false; }
-            }
-            if let Some(aid) = &filter.author_id {
-                if p.author_id != *aid { return false; }
-            }
-            if let Some(q) = &filter.query {
-                let q_lower = q.to_lowercase();
-                if !p.content.to_lowercase().contains(&q_lower) {
-                    return false;
-                }
-            }
-            true
-        })
-        .cloned()
-        .collect();
+    let mut sql = "SELECT * FROM posts WHERE 1=1".to_string();
 
-    // Sort by created_at desc
-    posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    if let Some(ref cat) = filter.category {
+        let cat_esc = cat.replace('\'', "''");
+        sql.push_str(&format!(" AND category = '{}'", cat_esc));
+    }
+    if let Some(ref aid) = filter.author_id {
+        let aid_esc = aid.replace('\'', "''");
+        sql.push_str(&format!(" AND author_id = '{}'", aid_esc));
+    }
+    if let Some(ref q) = filter.query {
+        let q_esc = q.replace('\'', "''");
+        sql.push_str(&format!(" AND LOWER(content) LIKE LOWER('%{}%')", q_esc));
+    }
+    sql.push_str(" ORDER BY created_at DESC");
 
-    Json(posts).into_response()
+    let rows = sqlx::query(&sql).fetch_all(&db.pool).await;
+    match rows {
+        Ok(rows) => Json(rows.iter().map(|r| post_from_row(r)).collect::<Vec<_>>()).into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    }
 }
 
 pub async fn get_post(
     Path(id): Path<Uuid>,
     State(db): State<Arc<Database>>,
 ) -> impl IntoResponse {
-    let posts = db.posts.lock().unwrap();
-    match posts.get(&id) {
-        Some(p) => Json(Some(p.clone())).into_response(),
-        None => (StatusCode::NOT_FOUND, "Post not found").into_response(),
+    let row = sqlx::query("SELECT * FROM posts WHERE id = $1")
+        .bind(id).fetch_optional(&db.pool).await;
+
+    match row {
+        Ok(Some(r)) => Json(post_from_row(&r)).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "Post not found").into_response(),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
     }
 }
 
@@ -157,226 +141,81 @@ pub async fn delete_post(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    let mut posts = db.posts.lock().unwrap();
-    if let Some(post) = posts.get(&id) {
-        if post.author_id != authenticated_id {
-            return (StatusCode::FORBIDDEN, "Not your post").into_response();
-        }
-        posts.remove(&id);
-        drop(posts);
-        db.save_all();
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Post not found").into_response()
-    }
-}
+    let author: Option<String> = sqlx::query_scalar("SELECT author_id FROM posts WHERE id = $1")
+        .bind(id).fetch_optional(&db.pool).await.unwrap_or(None);
 
-pub async fn like_post(
-    Path(id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let authenticated_id = match get_user_id_from_token(&headers) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    // Check if post exists
-    {
-        let posts = db.posts.lock().unwrap();
-        if !posts.contains_key(&id) {
-            return (StatusCode::NOT_FOUND, "Post not found").into_response();
-        }
+    match author {
+        None => return (StatusCode::NOT_FOUND, "Post not found").into_response(),
+        Some(aid) if aid != authenticated_id => return (StatusCode::FORBIDDEN, "Not your post").into_response(),
+        _ => {}
     }
 
-    let mut likes = db.post_likes.lock().unwrap();
-    if likes.iter().any(|l| l.post_id == id && l.user_id == authenticated_id) {
-        return (StatusCode::BAD_REQUEST, "Already liked").into_response();
-    }
-
-    likes.push(crate::database::models::PostLike {
-        post_id: id,
-        user_id: authenticated_id,
-        created_at: Utc::now(),
-    });
-    drop(likes);
-
-    // Update post like count
-    {
-        let mut posts = db.posts.lock().unwrap();
-        if let Some(post) = posts.get_mut(&id) {
-            post.likes_count += 1;
-        }
-    }
-
-    db.save_all();
-    StatusCode::OK.into_response()
-}
-
-pub async fn unlike_post(
-    Path(id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let authenticated_id = match get_user_id_from_token(&headers) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    let mut likes = db.post_likes.lock().unwrap();
-    let initial_len = likes.len();
-    likes.retain(|l| !(l.post_id == id && l.user_id == authenticated_id));
-    
-    if likes.len() < initial_len {
-        drop(likes);
-        let mut posts = db.posts.lock().unwrap();
-        if let Some(post) = posts.get_mut(&id) {
-            post.likes_count = (post.likes_count - 1).max(0);
-        }
-        db.save_all();
-        StatusCode::OK.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Like not found").into_response()
-    }
+    let _ = sqlx::query("DELETE FROM posts WHERE id = $1").bind(id).execute(&db.pool).await;
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub async fn get_post_comments(
     Path(id): Path<Uuid>,
     State(db): State<Arc<Database>>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
 ) -> impl IntoResponse {
-    let viewer_id = get_user_id_from_token(&headers);
+    let comment_rows = sqlx::query(
+        "SELECT pc.*, u.name as user_name, u.avatar as user_avatar
+         FROM post_comments pc
+         LEFT JOIN users u ON u.id = pc.user_id
+         WHERE pc.post_id = $1
+         ORDER BY pc.created_at ASC"
+    )
+    .bind(id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
 
-    // Collect comment data first (release lock immediately)
-    let comments_data: Vec<crate::database::models::PostComment> = {
-        let comments = db.post_comments.lock().unwrap();
-        comments.iter()
-            .filter(|c| c.post_id == id)
-            .cloned()
-            .collect()
-    };
+    let reply_rows = sqlx::query(
+        "SELECT cr.*, u.name as user_name, u.avatar as user_avatar
+         FROM comment_replies cr
+         LEFT JOIN users u ON u.id = cr.user_id
+         WHERE cr.post_id = $1
+         ORDER BY cr.created_at ASC"
+    )
+    .bind(id)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap_or_default();
 
-    // Collect comment likes count per comment (release lock)
-    let likes_data: Vec<crate::database::models::CommentLike> = {
-        let clikes = db.comment_likes.lock().unwrap();
-        clikes.iter()
-            .filter(|l| comments_data.iter().any(|c| c.id == l.comment_id))
-            .cloned()
-            .collect()
-    };
+    let comments: Vec<crate::database::models::CommentResponse> = comment_rows.iter().map(|cr| {
+        let comment_id: Uuid = sqlx::Row::get(cr, "id");
+        let replies: Vec<crate::database::models::ReplyResponse> = reply_rows.iter()
+            .filter(|rr| {
+                let rid: Uuid = sqlx::Row::get(*rr, "comment_id");
+                rid == comment_id
+            })
+            .map(|rr| crate::database::models::ReplyResponse {
+                id: sqlx::Row::get(rr, "id"),
+                comment_id: sqlx::Row::get(rr, "comment_id"),
+                user_id: sqlx::Row::get(rr, "user_id"),
+                user_name: sqlx::Row::try_get(rr, "user_name").ok().unwrap_or_else(|| "Unknown".to_string()),
+                user_avatar: sqlx::Row::try_get(rr, "user_avatar").ok().unwrap_or_default(),
+                content: sqlx::Row::get(rr, "content"),
+                created_at: sqlx::Row::get(rr, "created_at"),
+            })
+            .collect();
 
-    let post_comments: Vec<crate::database::models::CommentResponse> = {
-        let users = db.users.lock().unwrap();
-        comments_data.iter().map(|c| {
-            let (name, avatar) = if let Some(u) = users.get(&c.user_id) {
-                (u.name.clone(), u.avatar.clone())
-            } else {
-                ("Unknown".to_string(), "".to_string())
-            };
-            let likes_count = likes_data.iter().filter(|l| l.comment_id == c.id).count() as i32;
-            let is_liked = viewer_id.as_ref()
-                .map(|uid| likes_data.iter().any(|l| l.comment_id == c.id && &l.user_id == uid))
-                .unwrap_or(false);
-            crate::database::models::CommentResponse {
-                id: c.id,
-                post_id: c.post_id,
-                user_id: c.user_id.clone(),
-                user_name: name,
-                user_avatar: avatar,
-                content: c.content.clone(),
-                likes_count,
-                is_liked,
-                created_at: c.created_at,
-            }
-        }).collect()
-    };
+        crate::database::models::CommentResponse {
+            id: comment_id,
+            post_id: sqlx::Row::get(cr, "post_id"),
+            user_id: sqlx::Row::get(cr, "user_id"),
+            user_name: sqlx::Row::try_get(cr, "user_name").ok().unwrap_or_else(|| "Unknown".to_string()),
+            user_avatar: sqlx::Row::try_get(cr, "user_avatar").ok().unwrap_or_default(),
+            content: sqlx::Row::get(cr, "content"),
+            likes_count: 0,
+            is_liked: false,
+            replies,
+            created_at: sqlx::Row::get(cr, "created_at"),
+        }
+    }).collect();
 
-    Json(post_comments).into_response()
-}
-
-pub async fn like_comment(
-    Path(comment_id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let authenticated_id = match get_user_id_from_token(&headers) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    let mut likes = db.comment_likes.lock().unwrap();
-    if likes.iter().any(|l| l.comment_id == comment_id && l.user_id == authenticated_id) {
-        return (StatusCode::BAD_REQUEST, "Already liked").into_response();
-    }
-    likes.push(crate::database::models::CommentLike {
-        comment_id,
-        user_id: authenticated_id,
-        created_at: Utc::now(),
-    });
-    drop(likes);
-    db.save_all();
-    StatusCode::OK.into_response()
-}
-
-pub async fn unlike_comment(
-    Path(comment_id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    let authenticated_id = match get_user_id_from_token(&headers) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    {
-        let mut likes = db.comment_likes.lock().unwrap();
-        likes.retain(|l| !(l.comment_id == comment_id && l.user_id == authenticated_id));
-    }
-    db.save_all();
-    StatusCode::OK.into_response()
-}
-
-pub async fn add_reply(
-    Path(id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-    headers: HeaderMap,
-    Json(req): Json<crate::database::models::PostReplyRequest>,
-) -> impl IntoResponse {
-    let authenticated_id = match get_user_id_from_token(&headers) {
-        Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
-    };
-
-    let reply = crate::database::models::PostCommentReply {
-        id: Uuid::new_v4(),
-        comment_id: req.comment_id,
-        post_id: id,
-        user_id: authenticated_id,
-        content: req.content,
-        created_at: Utc::now(),
-    };
-
-    {
-        let mut replies = db.comment_replies.lock().unwrap();
-        replies.push(reply.clone());
-    }
-
-    db.save_all();
-    (StatusCode::CREATED, Json(reply)).into_response()
-}
-
-pub async fn get_replies(
-    Path(comment_id): Path<Uuid>,
-    State(db): State<Arc<Database>>,
-) -> impl IntoResponse {
-    let replies_data: Vec<crate::database::models::PostCommentReply> = {
-        let replies = db.comment_replies.lock().unwrap();
-        replies.iter()
-            .filter(|r| r.comment_id == comment_id)
-            .cloned()
-            .collect()
-    };
-    Json(replies_data).into_response()
+    Json(comments).into_response()
 }
 
 pub async fn add_comment(
@@ -390,38 +229,98 @@ pub async fn add_comment(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    // Check if post exists
-    {
-        let posts = db.posts.lock().unwrap();
-        if !posts.contains_key(&id) {
-            return (StatusCode::NOT_FOUND, "Post not found").into_response();
-        }
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM posts WHERE id = $1)")
+        .bind(id).fetch_one(&db.pool).await.unwrap_or(false);
+    if !exists {
+        return (StatusCode::NOT_FOUND, "Post not found").into_response();
     }
 
     let comment_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    let result = sqlx::query(
+        "INSERT INTO post_comments (id, post_id, user_id, content, created_at) VALUES ($1, $2, $3, $4, $5)"
+    )
+    .bind(comment_id).bind(id).bind(&authenticated_id).bind(&req.content).bind(now)
+    .execute(&db.pool).await;
+
+    if result.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+    }
+
+    let _ = sqlx::query("UPDATE posts SET comments_count = comments_count + 1 WHERE id = $1")
+        .bind(id).execute(&db.pool).await;
+
     let comment = crate::database::models::PostComment {
         id: comment_id,
         post_id: id,
         user_id: authenticated_id,
         content: req.content,
-        created_at: Utc::now(),
+        created_at: now,
+    };
+    (StatusCode::CREATED, Json(comment)).into_response()
+}
+
+pub async fn add_reply(
+    Path(id): Path<Uuid>,
+    State(db): State<Arc<Database>>,
+    headers: HeaderMap,
+    Json(req): Json<crate::database::models::PostReplyRequest>,
+) -> impl IntoResponse {
+    let authenticated_id = match get_user_id_from_token(&headers) {
+        Some(uid) => uid,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    {
-        let mut comments = db.post_comments.lock().unwrap();
-        comments.push(comment.clone());
+    let reply_id = Uuid::new_v4();
+    let now = Utc::now();
+
+    let result = sqlx::query(
+        "INSERT INTO comment_replies (id, comment_id, post_id, user_id, content, created_at) VALUES ($1, $2, $3, $4, $5, $6)"
+    )
+    .bind(reply_id).bind(req.comment_id).bind(id).bind(&authenticated_id).bind(&req.content).bind(now)
+    .execute(&db.pool).await;
+
+    if result.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
     }
 
-    // Update post comment count
-    {
-        let mut posts = db.posts.lock().unwrap();
-        if let Some(post) = posts.get_mut(&id) {
-            post.comments_count += 1;
+    let _ = sqlx::query("UPDATE posts SET comments_count = comments_count + 1 WHERE id = $1")
+        .bind(id).execute(&db.pool).await;
+
+    let reply = crate::database::models::PostCommentReply {
+        id: reply_id,
+        comment_id: req.comment_id,
+        post_id: id,
+        user_id: authenticated_id,
+        content: req.content,
+        created_at: now,
+    };
+    (StatusCode::CREATED, Json(reply)).into_response()
+}
+
+pub async fn get_replies(
+    Path(comment_id): Path<Uuid>,
+    State(db): State<Arc<Database>>,
+) -> impl IntoResponse {
+    let rows = sqlx::query("SELECT * FROM comment_replies WHERE comment_id = $1 ORDER BY created_at ASC")
+        .bind(comment_id)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap_or_default();
+
+    let replies: Vec<crate::database::models::PostCommentReply> = rows.iter().map(|r| {
+        crate::database::models::PostCommentReply {
+            id: sqlx::Row::get(r, "id"),
+            comment_id: sqlx::Row::get(r, "comment_id"),
+            post_id: sqlx::Row::get(r, "post_id"),
+            user_id: sqlx::Row::get(r, "user_id"),
+            content: sqlx::Row::get(r, "content"),
+            created_at: sqlx::Row::get(r, "created_at"),
         }
-    }
+    }).collect();
 
-    db.save_all();
-    (StatusCode::CREATED, Json(comment)).into_response()
+    Json(replies).into_response()
 }
 
 pub async fn delete_comment(
@@ -434,31 +333,79 @@ pub async fn delete_comment(
         None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
     };
 
-    let mut comments = db.post_comments.lock().unwrap();
-    let initial_len = comments.len();
-    
-    let mut authed = false;
-    if let Some(comment) = comments.iter().find(|c| c.id == comment_id) {
-        if comment.user_id == authenticated_id {
-            authed = true;
-        }
+    let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM post_comments WHERE id = $1")
+        .bind(comment_id).fetch_optional(&db.pool).await.unwrap_or(None);
+
+    match owner {
+        None => return (StatusCode::NOT_FOUND, "Comment not found").into_response(),
+        Some(uid) if uid != authenticated_id => return (StatusCode::FORBIDDEN, "Not your comment").into_response(),
+        _ => {}
     }
 
-    if !authed {
-        return (StatusCode::FORBIDDEN, "Not your comment").into_response();
-    }
+    let reply_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM comment_replies WHERE comment_id = $1")
+        .bind(comment_id).fetch_one(&db.pool).await.unwrap_or(0);
 
-    comments.retain(|c| c.id != comment_id);
-    
-    if comments.len() < initial_len {
-        drop(comments);
-        let mut posts = db.posts.lock().unwrap();
-        if let Some(post) = posts.get_mut(&post_id) {
-            post.comments_count = (post.comments_count - 1).max(0);
-        }
-        db.save_all();
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "Comment not found").into_response()
-    }
+    // Cascade deletes replies via FK
+    let _ = sqlx::query("DELETE FROM post_comments WHERE id = $1").bind(comment_id).execute(&db.pool).await;
+
+    let _ = sqlx::query(
+        "UPDATE posts SET comments_count = GREATEST(comments_count - $1, 0) WHERE id = $2"
+    )
+    .bind(1 + reply_count as i32).bind(post_id).execute(&db.pool).await;
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn check_post_favorite(
+    State(db): State<Arc<Database>>,
+    headers: HeaderMap,
+    Path(post_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let uid = match get_user_id_from_token(&headers) {
+        Some(uid) => uid,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+
+    let is_favorited: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM post_favorites WHERE post_id = $1 AND user_id = $2)"
+    )
+    .bind(post_id).bind(&uid)
+    .fetch_one(&db.pool).await.unwrap_or(false);
+
+    (StatusCode::OK, Json(crate::social::products::FavoriteStatusResponse { is_favorited })).into_response()
+}
+
+pub async fn favorite_post(
+    State(db): State<Arc<Database>>,
+    headers: HeaderMap,
+    Path(post_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let uid = match get_user_id_from_token(&headers) {
+        Some(uid) => uid,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+
+    let _ = sqlx::query(
+        "INSERT INTO post_favorites (post_id, user_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+    )
+    .bind(post_id).bind(&uid).bind(Utc::now())
+    .execute(&db.pool).await;
+
+    (StatusCode::OK, "Favorited").into_response()
+}
+
+pub async fn unfavorite_post(
+    State(db): State<Arc<Database>>,
+    headers: HeaderMap,
+    Path(post_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let uid = match get_user_id_from_token(&headers) {
+        Some(uid) => uid,
+        None => return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
+    };
+
+    let _ = sqlx::query("DELETE FROM post_favorites WHERE post_id = $1 AND user_id = $2")
+        .bind(post_id).bind(&uid).execute(&db.pool).await;
+
+    (StatusCode::OK, "Unfavorited").into_response()
 }

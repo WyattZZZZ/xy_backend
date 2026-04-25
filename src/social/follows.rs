@@ -7,49 +7,50 @@ use axum::{
 use chrono::Utc;
 use std::sync::Arc;
 use crate::database::Database;
-use crate::database::models::{Follow, FollowFilter};
+use crate::database::models::FollowFilter;
 use crate::verify::auth::get_user_id_from_token;
 
 pub async fn get_follows(
     Query(filter): Query<FollowFilter>,
     State(db): State<Arc<Database>>,
 ) -> impl IntoResponse {
-    let db_follows = db.follows.lock().unwrap();
-    let db_users = db.users.lock().unwrap();
-    
-    let results: Vec<crate::database::models::FollowUserItem> = db_follows.iter()
-        .filter(|f| {
-            let match_follower = filter.follower_id.as_ref().map_or(true, |id| &f.follower_id == id);
-            let match_following = filter.following_id.as_ref().map_or(true, |id| &f.following_id == id);
-            match_follower && match_following
-        })
-        .map(|f| {
-            // If we are looking for followers (following_id is fixed), we want the follower's info
-            // If we are looking for following (follower_id is fixed), we want the following target's info
-            // If both or neither are provided, we default to the "other" side based on common usage
-            let target_id = if filter.follower_id.is_some() {
-                &f.following_id
-            } else {
-                &f.follower_id
-            };
+    let rows = if let Some(ref follower_id) = filter.follower_id {
+        sqlx::query(
+            "SELECT u.id, u.name, u.avatar FROM follows f
+             JOIN users u ON u.id = f.following_id
+             WHERE f.follower_id = $1"
+        )
+        .bind(follower_id)
+        .fetch_all(&db.pool)
+        .await
+    } else if let Some(ref following_id) = filter.following_id {
+        sqlx::query(
+            "SELECT u.id, u.name, u.avatar FROM follows f
+             JOIN users u ON u.id = f.follower_id
+             WHERE f.following_id = $1"
+        )
+        .bind(following_id)
+        .fetch_all(&db.pool)
+        .await
+    } else {
+        sqlx::query("SELECT u.id, u.name, u.avatar FROM follows f JOIN users u ON u.id = f.following_id")
+            .fetch_all(&db.pool)
+            .await
+    };
 
-            if let Some(user) = db_users.get(target_id) {
+    match rows {
+        Ok(rows) => {
+            let results: Vec<crate::database::models::FollowUserItem> = rows.iter().map(|r| {
                 crate::database::models::FollowUserItem {
-                    id: user.id.clone(),
-                    name: user.name.clone(),
-                    avatar: user.avatar.clone(),
+                    id: sqlx::Row::get(r, "id"),
+                    name: sqlx::Row::get(r, "name"),
+                    avatar: sqlx::Row::get(r, "avatar"),
                 }
-            } else {
-                crate::database::models::FollowUserItem {
-                    id: target_id.clone(),
-                    name: "Unknown User".to_string(),
-                    avatar: "https://picsum.photos/200".to_string(),
-                }
-            }
-        })
-        .collect();
-        
-    Json(results).into_response()
+            }).collect();
+            Json(results).into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response(),
+    }
 }
 
 pub async fn follow_user(
@@ -59,41 +60,37 @@ pub async fn follow_user(
 ) -> impl IntoResponse {
     let authenticated_id = match get_user_id_from_token(&headers) {
         Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"status": "error", "message": "Unauthorized"}))).into_response(),
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"status":"error","message":"Unauthorized"}))).into_response(),
     };
-    
+
     if authenticated_id == id {
-        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"status": "error", "message": "Cannot follow yourself"}))).into_response();
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"status":"error","message":"Cannot follow yourself"}))).into_response();
     }
 
-    let mut follow_added = false;
-    {
-        let mut db_follows = db.follows.lock().unwrap();
-        if !db_follows.iter().any(|f| f.follower_id == authenticated_id && f.following_id == id) {
-            db_follows.push(Follow {
-                follower_id: authenticated_id.clone(),
-                following_id: id.clone(),
-                created_at: Utc::now(),
-            });
-            follow_added = true;
+    let now = Utc::now();
+    let result = sqlx::query(
+        "INSERT INTO follows (follower_id, following_id, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"
+    )
+    .bind(&authenticated_id)
+    .bind(&id)
+    .bind(now)
+    .execute(&db.pool)
+    .await;
+
+    if let Ok(r) = result {
+        if r.rows_affected() > 0 {
+            let _ = sqlx::query("UPDATE users SET following = following + 1 WHERE id = $1")
+                .bind(&authenticated_id)
+                .execute(&db.pool)
+                .await;
+            let _ = sqlx::query("UPDATE users SET fans = fans + 1 WHERE id = $1")
+                .bind(&id)
+                .execute(&db.pool)
+                .await;
         }
     }
 
-    if follow_added {
-        let mut db_users = db.users.lock().unwrap();
-        // Update follower's following count
-        if let Some(user) = db_users.get_mut(&authenticated_id) {
-            user.following += 1;
-        }
-        // Update following's fans count
-        if let Some(target) = db_users.get_mut(&id) {
-            target.fans += 1;
-        }
-        drop(db_users);
-        db.save_all();
-    }
-
-    Json(serde_json::json!({"status": "ok"})).into_response()
+    Json(serde_json::json!({"status":"ok"})).into_response()
 }
 
 pub async fn unfollow_user(
@@ -103,32 +100,27 @@ pub async fn unfollow_user(
 ) -> impl IntoResponse {
     let authenticated_id = match get_user_id_from_token(&headers) {
         Some(uid) => uid,
-        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"status": "error", "message": "Unauthorized"}))).into_response(),
+        None => return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"status":"error","message":"Unauthorized"}))).into_response(),
     };
-    
-    let mut follow_removed = false;
-    {
-        let mut db_follows = db.follows.lock().unwrap();
-        let initial_len = db_follows.len();
-        db_follows.retain(|f| !(f.follower_id == authenticated_id && f.following_id == id));
-        if db_follows.len() < initial_len {
-            follow_removed = true;
+
+    let result = sqlx::query("DELETE FROM follows WHERE follower_id = $1 AND following_id = $2")
+        .bind(&authenticated_id)
+        .bind(&id)
+        .execute(&db.pool)
+        .await;
+
+    if let Ok(r) = result {
+        if r.rows_affected() > 0 {
+            let _ = sqlx::query("UPDATE users SET following = GREATEST(following - 1, 0) WHERE id = $1")
+                .bind(&authenticated_id)
+                .execute(&db.pool)
+                .await;
+            let _ = sqlx::query("UPDATE users SET fans = GREATEST(fans - 1, 0) WHERE id = $1")
+                .bind(&id)
+                .execute(&db.pool)
+                .await;
         }
     }
 
-    if follow_removed {
-        let mut db_users = db.users.lock().unwrap();
-        // Update follower's following count
-        if let Some(user) = db_users.get_mut(&authenticated_id) {
-            if user.following > 0 { user.following -= 1; }
-        }
-        // Update following's fans count
-        if let Some(target) = db_users.get_mut(&id) {
-            if target.fans > 0 { target.fans -= 1; }
-        }
-        drop(db_users);
-        db.save_all();
-    }
-
-    Json(serde_json::json!({"status": "ok"})).into_response()
+    Json(serde_json::json!({"status":"ok"})).into_response()
 }

@@ -5,10 +5,10 @@
     "title": "lotus",
     "description": "111",
     "price": 1.0,
-    "location": "Yosko Drive, Piscataway Township",
+    "location": "Piscataway Township",
     "coordinates": {
-      "lat": 40.52720817531682,
-      "lng": -74.42168195995114
+      "lat": 41,
+      "lng": -75
     },
     "category": "fashion",
     "tags": [
